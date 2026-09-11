@@ -17,6 +17,7 @@ PLANNING_DAYS = 14
 MIN_CHUNK_MINUTES = 15
 PREFERRED_MAX_CHUNK_MINUTES = 45
 
+# This exact task acts as the PFS weekly requirement.
 PFS_TASK_NAME = "PFS weekly hours"
 PFS_WEEKLY_TARGET_MINUTES = 30 * 60
 
@@ -115,25 +116,49 @@ def search_all(query):
 
 
 def find_database(name):
+    """
+    Find the actual Notion database whose title exactly
+    matches the requested name.
+
+    Notion search can return data_source objects associated
+    with linked database views. We therefore verify the
+    parent database's actual title before accepting it.
+    """
+
     for obj in search_all(name):
 
-        if obj.get("object") == "data_source":
+        # Direct database result
+        if obj.get("object") == "database":
+
+            title = "".join(
+                item.get("plain_text", "")
+                for item in obj.get("title", [])
+            ).strip()
+
+            if title == name:
+                return obj["id"]
+
+        # Data source result
+        elif obj.get("object") == "data_source":
+
             parent = obj.get("parent", {})
             database_id = parent.get("database_id")
 
-            if database_id:
+            if not database_id:
+                continue
+
+            database = notion(
+                "GET",
+                f"databases/{database_id}",
+            )
+
+            title = "".join(
+                item.get("plain_text", "")
+                for item in database.get("title", [])
+            ).strip()
+
+            if title == name:
                 return database_id
-
-        elif obj.get("object") == "database":
-
-            title = ""
-
-            for item in obj.get("title", []):
-                if item.get("plain_text"):
-                    title += item["plain_text"]
-
-            if title.strip() == name:
-                return obj["id"]
 
     raise RuntimeError(
         f'Could not find Notion database "{name}".'
@@ -311,7 +336,7 @@ def read_master_tasks():
         name = title_value(
             page,
             "Task",
-        )
+        ).strip()
 
         if not name:
             continue
@@ -326,7 +351,7 @@ def read_master_tasks():
             "Unit",
         )
 
-        task = {
+        tasks.append({
             "page_id": page["id"],
             "task": name,
             "project": select_value(
@@ -347,14 +372,11 @@ def read_master_tasks():
                 page,
                 "Continuous",
             ),
-        }
-
-        task["minutes"] = workload_to_minutes(
-            workload,
-            unit,
-        )
-
-        tasks.append(task)
+            "minutes": workload_to_minutes(
+                workload,
+                unit,
+            ),
+        })
 
     return tasks
 
@@ -382,7 +404,7 @@ def read_focus_time():
         days=PLANNING_DAYS
     )
 
-    blocks = []
+    all_blocks = []
 
     for page in pages:
 
@@ -400,12 +422,40 @@ def read_focus_time():
         if not end:
             continue
 
+        all_blocks.append({
+            "page_id": page["id"],
+            "original_start": start,
+            "original_end": end,
+            "start": start,
+            "end": end,
+        })
+
+    # Sort everything chronologically.
+    all_blocks.sort(
+        key=lambda block: block["start"]
+    )
+
+    # Keep a complete copy for accounting, while
+    # producing schedulable future capacity below.
+    accounting_blocks = list(all_blocks)
+
+    schedulable_blocks = []
+
+    for block in all_blocks:
+
+        start = block["start"]
+        end = block["end"]
+
+        # Past blocks are not available for new scheduling.
         if end <= now:
             continue
 
+        # Outside the planning horizon.
         if start >= horizon:
             continue
 
+        # If a block is already underway, only the
+        # remaining portion is available.
         if start < now:
             start = now
 
@@ -420,23 +470,19 @@ def read_focus_time():
         if minutes <= 0:
             continue
 
-        blocks.append({
-            "page_id": page["id"],
+        schedulable_blocks.append({
+            "page_id": block["page_id"],
             "start": start,
             "end": end,
             "capacity": minutes,
             "remaining": minutes,
         })
 
-    blocks.sort(
-        key=lambda block: block["start"]
-    )
-
-    return blocks
+    return accounting_blocks, schedulable_blocks
 
 
 # ============================================================
-# EXISTING ALLOCATIONS
+# TASK ALLOCATIONS
 # ============================================================
 
 def read_allocations():
@@ -485,10 +531,10 @@ def read_allocations():
 
 
 # ============================================================
-# EXISTING ALLOCATION ACCOUNTING
+# EXISTING WORK ACCOUNTING
 # ============================================================
 
-def existing_allocation_minutes(
+def allocation_minutes(
     allocation,
     master_tasks_by_id,
 ):
@@ -515,19 +561,12 @@ def calculate_existing_work(
     allocations,
     master_tasks_by_id,
 ):
-    """
-    Returns:
-
-    completed work by task
-    planned/incomplete work by task
-    """
-
     completed = {}
     planned = {}
 
     for allocation in allocations:
 
-        minutes = existing_allocation_minutes(
+        minutes = allocation_minutes(
             allocation,
             master_tasks_by_id,
         )
@@ -557,19 +596,20 @@ def calculate_existing_work(
     return completed, planned
 
 
+# ============================================================
+# RESERVE EXISTING FUTURE ALLOCATIONS
+# ============================================================
+
 def reserve_existing_focus_time(
     allocations,
     focus_blocks,
     master_tasks_by_id,
 ):
     """
-    Existing incomplete allocations reserve
-    their Focus Time so a later scheduler run
-    does not duplicate them.
+    Existing incomplete allocations already occupy
+    Focus Time and must not be duplicated.
 
-    Completed allocations also consume their
-    Focus Time, but they do not reserve future
-    capacity.
+    Completed allocations do not consume future capacity.
     """
 
     blocks_by_id = {
@@ -582,21 +622,11 @@ def reserve_existing_focus_time(
         if allocation["completed"]:
             continue
 
-        amount = existing_allocation_minutes(
-            allocation,
-            master_tasks_by_id,
-        )
-
-        if amount <= 0:
-            continue
-
         focus_ids = allocation["focus_ids"]
 
         if not focus_ids:
             continue
 
-        # An allocation should normally point to
-        # exactly one Focus Time block.
         focus_id = focus_ids[0]
 
         block = blocks_by_id.get(
@@ -606,14 +636,19 @@ def reserve_existing_focus_time(
         if not block:
             continue
 
+        minutes = allocation_minutes(
+            allocation,
+            master_tasks_by_id,
+        )
+
         block["remaining"] = max(
             0,
-            block["remaining"] - amount,
+            block["remaining"] - minutes,
         )
 
 
 # ============================================================
-# DEADLINES / PRIORITY
+# PRIORITY
 # ============================================================
 
 def priority_multiplier(priority):
@@ -624,7 +659,7 @@ def priority_multiplier(priority):
     if priority == "Medium":
         return 1.05
 
-    return 1.0
+    return 1.00
 
 
 def hours_until_deadline(
@@ -651,12 +686,12 @@ def task_score(
 
     if hours is None:
 
-        # Undated work is deliberately low priority.
+        # Undated work is low priority.
         deadline_score = 0.1
 
     elif hours <= 0:
 
-        # Overdue.
+        # Overdue work is extremely urgent.
         deadline_score = 100000
 
     else:
@@ -669,9 +704,8 @@ def task_score(
         task["priority"]
     )
 
-    # Give large tasks a modest advantage so
-    # they begin early rather than becoming
-    # last-minute emergencies.
+    # Modest advantage for large tasks so they
+    # begin early instead of becoming emergencies.
     size_score = min(
         2.0,
         remaining_minutes / 120,
@@ -682,6 +716,40 @@ def task_score(
         * priority_score
         + size_score
     )
+
+
+# ============================================================
+# GENERAL TASK ELIGIBILITY
+# ============================================================
+
+def task_is_eligible(
+    task,
+    remaining_minutes,
+    now,
+):
+    if remaining_minutes <= 0:
+        return False
+
+    deadline = task["deadline"]
+
+    # Undated work can use otherwise-unused capacity.
+    if not deadline:
+        return True
+
+    deadline_dt = deadline["start"]
+    deadline_date = deadline_dt.date()
+    today = now.date()
+
+    # Overdue.
+    if deadline_dt <= now:
+        return True
+
+    # Deadline day:
+    # only use Focus Time if 15 minutes or less remain.
+    if deadline_date == today:
+        return remaining_minutes <= 15
+
+    return True
 
 
 # ============================================================
@@ -701,8 +769,7 @@ def choose_allocation_size(
     if maximum <= 0:
         return 0
 
-    # Continuous means the entire remaining task
-    # must fit into ONE Focus Time block.
+    # Continuous tasks cannot be split.
     if task["continuous"]:
 
         if remaining_minutes <= available_minutes:
@@ -710,20 +777,19 @@ def choose_allocation_size(
 
         return 0
 
-    # If the task can be finished in <=45 minutes,
-    # finish it.
+    # Finish anything that fits within 45 minutes.
     if maximum <= PREFERRED_MAX_CHUNK_MINUTES:
         return maximum
 
-    # Otherwise prefer a 45-minute chunk.
+    # Prefer 45-minute chunks.
     chunk = PREFERRED_MAX_CHUNK_MINUTES
 
     remainder = remaining_minutes - chunk
 
-    # Avoid creating a tiny final fragment.
+    # Avoid leaving a final fragment of <=15 minutes.
     if (
         0 < remainder
-        < MIN_CHUNK_MINUTES
+        <= MIN_CHUNK_MINUTES
     ):
         return remaining_minutes
 
@@ -731,7 +797,7 @@ def choose_allocation_size(
 
 
 # ============================================================
-# GENERAL SCHEDULING
+# GENERAL TASK SCHEDULING
 # ============================================================
 
 def schedule_general_tasks(
@@ -748,7 +814,12 @@ def schedule_general_tasks(
 
         task_id = task["page_id"]
 
-        already_done = completed.get(
+        # The special PFS weekly-hours task is handled
+        # separately.
+        if task["task"] == PFS_TASK_NAME:
+            continue
+
+        already_completed = completed.get(
             task_id,
             0,
         )
@@ -761,7 +832,7 @@ def schedule_general_tasks(
         remaining[task_id] = max(
             0,
             task["minutes"]
-            - already_done
+            - already_completed
             - already_planned,
         )
 
@@ -780,6 +851,9 @@ def schedule_general_tasks(
 
                 task_id = task["page_id"]
 
+                if task["task"] == PFS_TASK_NAME:
+                    continue
+
                 rem = remaining.get(
                     task_id,
                     0,
@@ -788,12 +862,10 @@ def schedule_general_tasks(
                 if rem <= 0:
                     continue
 
-                # PFS weekly-hours is handled
-                # separately.
-                if (
-                    task["project"] == "PFS"
-                    and task["task"]
-                    == PFS_TASK_NAME
+                if not task_is_eligible(
+                    task,
+                    rem,
+                    now,
                 ):
                     continue
 
@@ -802,6 +874,27 @@ def schedule_general_tasks(
                     rem,
                     now,
                 )
+
+                # Small preference for tasks not yet
+                # worked on today, helping distribute
+                # larger projects.
+                already_today = sum(
+                    allocation["amount_minutes"]
+                    for allocation in new_allocations
+                    if (
+                        allocation["task"]["page_id"]
+                        == task_id
+                        and
+                        get_block_date(
+                            allocation,
+                            focus_blocks,
+                        )
+                        == block["start"].date()
+                    )
+                )
+
+                if already_today > 0:
+                    score *= 0.85
 
                 candidates.append(
                     (score, task)
@@ -853,33 +946,51 @@ def schedule_general_tasks(
     return new_allocations, remaining
 
 
-# ============================================================
-# PFS
-# ============================================================
+def get_block_date(
+    allocation,
+    focus_blocks,
+):
+    for block in focus_blocks:
 
-def monday_of_week(date):
-    return date - timedelta(
-        days=date.weekday()
-    )
+        if (
+            block["page_id"]
+            == allocation["focus_page_id"]
+        ):
+            return block["start"].date()
 
+    return None
+
+
+# ============================================================
+# PFS WEEKLY TARGET
+# ============================================================
 
 def current_week_range():
+
     today = datetime.now(TZ).date()
 
-    start = monday_of_week(today)
-    end = start + timedelta(days=7)
+    monday = (
+        today
+        - timedelta(days=today.weekday())
+    )
 
-    return start, end
+    sunday_plus_one = (
+        monday
+        + timedelta(days=7)
+    )
+
+    return monday, sunday_plus_one
 
 
 def pfs_minutes_this_week(
     allocations,
-    focus_blocks,
+    all_focus_blocks,
     master_tasks_by_id,
 ):
     """
-    Counts completed and already-planned PFS
-    allocations occurring this Monday-Sunday.
+    Count all PFS allocations in the current
+    Monday-Sunday week, including completed work
+    and existing incomplete planned work.
     """
 
     week_start, week_end = (
@@ -888,7 +999,7 @@ def pfs_minutes_this_week(
 
     blocks_by_id = {
         block["page_id"]: block
-        for block in focus_blocks
+        for block in all_focus_blocks
     }
 
     total = 0
@@ -896,6 +1007,7 @@ def pfs_minutes_this_week(
     for allocation in allocations:
 
         is_pfs = False
+        pfs_unit = None
 
         for master_id in allocation["master_ids"]:
 
@@ -908,6 +1020,7 @@ def pfs_minutes_this_week(
                 and task["project"] == "PFS"
             ):
                 is_pfs = True
+                pfs_unit = task["unit"]
                 break
 
         if not is_pfs:
@@ -930,15 +1043,10 @@ def pfs_minutes_this_week(
                 < week_end
             ):
 
-                task = master_tasks_by_id.get(
-                    allocation["master_ids"][0]
+                total += workload_to_minutes(
+                    allocation["allocation"],
+                    pfs_unit,
                 )
-
-                if task:
-                    total += workload_to_minutes(
-                        allocation["allocation"],
-                        task["unit"],
-                    )
 
     return total
 
@@ -947,35 +1055,36 @@ def schedule_pfs(
     pfs_task,
     focus_blocks,
     existing_allocations,
+    all_focus_blocks,
     master_tasks_by_id,
 ):
     """
-    Schedule only the amount needed to reach
-    the 30-hour Monday-Sunday PFS target.
+    Schedule enough PFS weekly-hours work to bring
+    the current Monday-Sunday total to 30 hours.
 
-    PFS weekly hours is represented in Master
-    To-Do List as 30 Hours, but allocations are
-    created in natural PFS hours.
+    Individual PFS tasks count toward the same target.
     """
 
-    week_start, week_end = (
-        current_week_range()
-    )
-
-    existing = pfs_minutes_this_week(
-        existing_allocations,
-        focus_blocks,
-        master_tasks_by_id,
+    existing_minutes = (
+        pfs_minutes_this_week(
+            existing_allocations,
+            all_focus_blocks,
+            master_tasks_by_id,
+        )
     )
 
     remaining_target = max(
         0,
         PFS_WEEKLY_TARGET_MINUTES
-        - existing,
+        - existing_minutes,
     )
 
     if remaining_target <= 0:
         return []
+
+    week_start, week_end = (
+        current_week_range()
+    )
 
     new_allocations = []
 
@@ -984,12 +1093,12 @@ def schedule_pfs(
         if block["remaining"] < MIN_CHUNK_MINUTES:
             continue
 
-        block_date = block["start"].date()
+        date = block["start"].date()
 
-        if block_date < week_start:
+        if date < week_start:
             continue
 
-        if block_date >= week_end:
+        if date >= week_end:
             continue
 
         amount = min(
@@ -1039,15 +1148,13 @@ def create_allocation(
         "amount_minutes"
     ]
 
-    unit = task["unit"]
-
     amount_units = minutes_to_units(
         amount_minutes,
-        unit,
+        task["unit"],
     )
 
-    # Keep names readable.
-    if unit == "Hours":
+    # Make the allocation name readable.
+    if task["unit"] == "Hours":
 
         name = (
             f'{task["task"]} — '
@@ -1058,7 +1165,8 @@ def create_allocation(
 
         name = (
             f'{task["task"]} — '
-            f'{amount_units:g} {unit}'
+            f'{amount_units:g} '
+            f'{task["unit"]}'
         )
 
     properties = {
@@ -1142,8 +1250,10 @@ def calculate_status(
         if not task["deadline"]:
             continue
 
+        deadline = task["deadline"]["start"]
+
         if (
-            task["deadline"]["start"]
+            deadline
             <= now + timedelta(days=18)
         ):
             required += rem
@@ -1186,7 +1296,7 @@ def main():
     print()
 
     # --------------------------------------------------------
-    # TASKS
+    # MASTER TASKS
     # --------------------------------------------------------
 
     print("Reading Master To-Do List...")
@@ -1194,9 +1304,14 @@ def main():
     tasks = read_master_tasks()
 
     print(
-        f"Schedulable tasks found: "
+        f"Master tasks found: "
         f"{len(tasks)}"
     )
+
+    if not tasks:
+        print(
+            "No incomplete Master tasks found."
+        )
 
     # --------------------------------------------------------
     # FOCUS TIME
@@ -1204,7 +1319,9 @@ def main():
 
     print("Reading Focus time...")
 
-    focus_blocks = read_focus_time()
+    all_focus_blocks, focus_blocks = (
+        read_focus_time()
+    )
 
     print(
         f"Focus Time blocks found: "
@@ -1240,8 +1357,8 @@ def main():
         )
     )
 
-    # Reserve future Focus Time already
-    # occupied by incomplete allocations.
+    # Existing incomplete allocations reserve
+    # their future Focus Time.
     reserve_existing_focus_time(
         existing_allocations,
         focus_blocks,
@@ -1256,11 +1373,7 @@ def main():
 
     for task in tasks:
 
-        if (
-            task["project"] == "PFS"
-            and task["task"]
-            == PFS_TASK_NAME
-        ):
+        if task["task"] == PFS_TASK_NAME:
             pfs_task = task
             break
 
@@ -1277,7 +1390,13 @@ def main():
             pfs_task,
             focus_blocks,
             existing_allocations,
+            all_focus_blocks,
             master_tasks_by_id,
+        )
+
+        print(
+            f"PFS allocations to create: "
+            f"{len(pfs_allocations)}"
         )
 
     else:
@@ -1291,19 +1410,9 @@ def main():
     # GENERAL TASKS
     # --------------------------------------------------------
 
-    general_tasks = [
-        task
-        for task in tasks
-        if not (
-            task["project"] == "PFS"
-            and task["task"]
-            == PFS_TASK_NAME
-        )
-    ]
-
     general_allocations, remaining = (
         schedule_general_tasks(
-            general_tasks,
+            tasks,
             focus_blocks,
             completed,
             planned,
@@ -1316,7 +1425,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # WRITE OUTPUT
+    # CREATE ALLOCATIONS
     # --------------------------------------------------------
 
     print()
