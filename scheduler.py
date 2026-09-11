@@ -1,8 +1,6 @@
 import os
-import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
-
 import requests
 
 
@@ -15,22 +13,18 @@ NOTION_VERSION = "2026-03-11"
 
 TZ = ZoneInfo("America/Los_Angeles")
 
-# Planning horizon for actual allocations
-HORIZON_DAYS = 14
+PLANNING_DAYS = 14
 
-# Capacity/status lookahead
-STATUS_LOOKAHEAD_DAYS = 18
+MIN_CHUNK_MINUTES = 15
+PREFERRED_MAX_CHUNK_MINUTES = 45
 
-# Normal work chunk size
-MIN_CHUNK = 15
-MAX_CHUNK = 45
+PFS_TASK_NAME = "PFS weekly hours"
+PFS_WEEKLY_TARGET_MINUTES = 30 * 60
 
 
 # ============================================================
 # NOTION API
 # ============================================================
-
-BASE = "https://api.notion.com/v1"
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -39,49 +33,52 @@ HEADERS = {
 }
 
 
-def notion(method, path, payload=None, params=None):
+def notion(method, path, **kwargs):
+    url = f"https://api.notion.com/v1/{path}"
+
     response = requests.request(
         method,
-        BASE + path,
+        url,
         headers=HEADERS,
-        json=payload,
-        params=params,
-        timeout=30,
+        **kwargs,
     )
 
     if not response.ok:
         raise RuntimeError(
-            f"Notion API {response.status_code}: {response.text}"
+            f"Notion API error {response.status_code}: "
+            f"{response.text}"
         )
 
-    return response.json() if response.text else {}
+    return response.json()
 
 
-# ============================================================
-# NOTION SEARCH / DATABASE DISCOVERY
-# ============================================================
-
-def search_all(query=""):
+def search_all(query):
     results = []
     cursor = None
 
     while True:
-        body = {"page_size": 100}
-
-        if query:
-            body["query"] = query
+        payload = {
+            "query": query,
+            "page_size": 100,
+        }
 
         if cursor:
-            body["start_cursor"] = cursor
+            payload["start_cursor"] = cursor
 
-        data = notion("POST", "/search", body)
+        data = notion(
+            "POST",
+            "search",
+            json=payload,
+        )
 
         results.extend(data.get("results", []))
 
         if not data.get("has_more"):
-            return results
+            break
 
         cursor = data.get("next_cursor")
+
+    return results
 
 
 def find_database(name):
@@ -110,157 +107,137 @@ def find_database(name):
 
 
 def get_data_source(database_id):
-    database = notion(
+    data = notion(
         "GET",
-        f"/databases/{database_id}"
+        f"databases/{database_id}",
     )
 
-    sources = database.get("data_sources", [])
+    sources = data.get("data_sources", [])
 
     if not sources:
         raise RuntimeError(
-            f"Database {database_id} has no data source."
+            f"No data source found for database {database_id}."
         )
 
     return sources[0]["id"]
 
 
-def get_schema(data_source_id):
-    data = notion(
-        "GET",
-        f"/data_sources/{data_source_id}"
-    )
-
-    return data.get("properties", {})
-
-
-# ============================================================
-# QUERY ALL PAGES
-# ============================================================
-
-def all_pages(data_source_id):
-    results = []
+def query_data_source(data_source_id):
+    pages = []
     cursor = None
 
     while True:
-        body = {
-            "page_size": 100
+        payload = {
+            "page_size": 100,
         }
 
         if cursor:
-            body["start_cursor"] = cursor
+            payload["start_cursor"] = cursor
 
         data = notion(
             "POST",
-            f"/data_sources/{data_source_id}/query",
-            body
+            f"data_sources/{data_source_id}/query",
+            json=payload,
         )
 
-        results.extend(
-            [
-                page
-                for page in data.get("results", [])
-                if page.get("object") == "page"
-            ]
-        )
+        pages.extend(data.get("results", []))
 
         if not data.get("has_more"):
-            return results
+            break
 
         cursor = data.get("next_cursor")
+
+    return pages
 
 
 # ============================================================
 # PROPERTY HELPERS
 # ============================================================
 
-def prop(page, name):
-    return page.get("properties", {}).get(name, {})
+def title_value(page, property_name):
+    prop = page["properties"].get(property_name)
+
+    if not prop or prop["type"] != "title":
+        return ""
+
+    return "".join(
+        item.get("plain_text", "")
+        for item in prop.get("title", [])
+    )
 
 
-def title_value(page, name):
-    p = prop(page, name)
+def checkbox_value(page, property_name):
+    prop = page["properties"].get(property_name)
 
-    if p.get("type") == "title":
-        return "".join(
-            item.get("plain_text", "")
-            for item in p.get("title", [])
-        )
+    if not prop or prop["type"] != "checkbox":
+        return False
 
-    return ""
+    return prop.get("checkbox", False)
 
 
-def text_value(page, name):
-    p = prop(page, name)
+def number_value(page, property_name):
+    prop = page["properties"].get(property_name)
 
-    if p.get("type") == "rich_text":
-        return "".join(
-            item.get("plain_text", "")
-            for item in p.get("rich_text", [])
-        )
-
-    if p.get("type") == "select":
-        return (p.get("select") or {}).get("name", "")
-
-    if p.get("type") == "status":
-        return (p.get("status") or {}).get("name", "")
-
-    return ""
-
-
-def number_value(page, name):
-    p = prop(page, name)
-
-    if p.get("type") == "number":
-        return p.get("number")
-
-    return None
-
-
-def checkbox_value(page, name):
-    p = prop(page, name)
-
-    if p.get("type") == "checkbox":
-        return bool(p.get("checkbox"))
-
-    return False
-
-
-def relation_ids(page, name):
-    p = prop(page, name)
-
-    if p.get("type") == "relation":
-        return [
-            item["id"]
-            for item in p.get("relation", [])
-        ]
-
-    return []
-
-
-def date_value(page, name):
-    p = prop(page, name)
-
-    if p.get("type") != "date":
+    if not prop or prop["type"] != "number":
         return None
 
-    return p.get("date")
+    return prop.get("number")
 
 
-# ============================================================
-# DATE HELPERS
-# ============================================================
+def select_value(page, property_name):
+    prop = page["properties"].get(property_name)
+
+    if not prop or prop["type"] != "select":
+        return None
+
+    option = prop.get("select")
+
+    if not option:
+        return None
+
+    return option.get("name")
+
+
+def date_value(page, property_name):
+    prop = page["properties"].get(property_name)
+
+    if not prop or prop["type"] != "date":
+        return None
+
+    date = prop.get("date")
+
+    if not date:
+        return None
+
+    start = date.get("start")
+    end = date.get("end")
+
+    if not start:
+        return None
+
+    return {
+        "start": parse_datetime(start),
+        "end": parse_datetime(end) if end else None,
+    }
+
+
+def relation_ids(page, property_name):
+    prop = page["properties"].get(property_name)
+
+    if not prop or prop["type"] != "relation":
+        return []
+
+    return [
+        item["id"]
+        for item in prop.get("relation", [])
+    ]
+
 
 def parse_datetime(value):
-    if not value:
-        return None
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
 
-    text = value
-
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-
-    dt = datetime.fromisoformat(text)
+    dt = datetime.fromisoformat(value)
 
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=TZ)
@@ -268,829 +245,923 @@ def parse_datetime(value):
     return dt.astimezone(TZ)
 
 
-def task_deadline(page):
-    data = date_value(page, "Deadline")
-
-    if not data:
-        return None
-
-    return parse_datetime(data.get("start"))
-
-
-def focus_interval(page):
-    data = date_value(page, "Date")
-
-    if not data:
-        return None
-
-    start = parse_datetime(data.get("start"))
-
-    if not start:
-        return None
-
-    end = parse_datetime(data.get("end"))
-
-    if not end:
-        end = start + timedelta(minutes=60)
-
-    return start, end
-
-
 # ============================================================
 # WORKLOAD CONVERSIONS
 # ============================================================
 
-def build_conversion_map(pages):
-    conversions = {}
-
-    for page in pages:
-        unit = text_value(page, "Unit")
-        minutes = number_value(page, "Minutes per Unit")
-
-        if unit and minutes is not None:
-            conversions[unit] = float(minutes)
-
-    return conversions
+MINUTES_PER_UNIT = {
+    "Pages": 5,
+    "LSAT Questions": 3,
+    "Papers": 10,
+    "Hours": 60,
+    "Minutes": 1,
+}
 
 
-def calculate_task_minutes(page, conversions):
-    workload = number_value(page, "Workload")
-    unit = text_value(page, "Unit")
-
+def workload_minutes(workload, unit):
     if workload is None or not unit:
-        return None
+        return 0
 
-    if unit not in conversions:
-        return None
-
-    return float(workload) * conversions[unit]
-
-
-# ============================================================
-# DISPLAY
-# ============================================================
-
-def allocation_name(task_name, minutes, unit, conversions):
-    minutes_per_unit = conversions.get(unit)
-
-    # Natural-unit tasks
-    if (
-        minutes_per_unit
-        and minutes_per_unit > 0
-        and unit not in ("Hours", "Minutes")
-    ):
-        units = int(round(minutes / minutes_per_unit))
-
-        if units > 0:
-            return (
-                f"{task_name} — "
-                f"{units} {unit.lower()}"
-            )
-
-    # Time-based tasks
-    hours = minutes // 60
-    remaining_minutes = minutes % 60
-
-    if hours and remaining_minutes:
-        amount = f"{hours}h {remaining_minutes}m"
-    elif hours:
-        amount = f"{hours}h"
-    else:
-        amount = f"{remaining_minutes} min"
-
-    return f"{task_name} — {amount}"
-
-
-# ============================================================
-# SCHEDULING LOGIC
-# ============================================================
-
-def priority_multiplier(priority):
-    return {
-        "High": 1.25,
-        "Medium": 1.05,
-        "Low": 1.0,
-    }.get(priority, 1.0)
-
-
-def deadline_urgency(deadline, now):
-    if not deadline:
-        return 0.05
-
-    hours_remaining = (
-        deadline - now
-    ).total_seconds() / 3600
-
-    if hours_remaining <= 0:
-        return 1000.0
-
-    return 100.0 / ((hours_remaining + 1.0) ** 2)
-
-
-def future_capacity_before(blocks, deadline, now):
-    total = 0
-
-    for block in blocks:
-
-        if block["start"] >= deadline:
-            continue
-
-        end = min(
-            block["end"],
-            deadline
+    if unit not in MINUTES_PER_UNIT:
+        raise RuntimeError(
+            f'Unknown workload unit "{unit}".'
         )
 
-        start = max(
-            block["start"],
-            now
-        )
-
-        if end > start:
-            total += int(
-                (end - start).total_seconds() / 60
-            )
-
-    return total
-
-
-def qualifies(task, blocks, now):
-    """
-    A task qualifies when it has meaningful scheduling risk.
-
-    The 14-day horizon is NOT itself the qualification rule.
-    A task can qualify earlier when its size makes future
-    capacity vulnerable.
-    """
-
-    if task["remaining"] <= 0:
-        return False
-
-    deadline = task["deadline"]
-
-    # Undated tasks do not consume scarce scheduling capacity
-    # merely because empty Focus Time exists.
-    if deadline is None:
-        return False
-
-    # Overdue work always qualifies.
-    if deadline <= now:
-        return True
-
-    future_capacity = future_capacity_before(
-        blocks,
-        deadline,
-        now
-    )
-
-    # Larger tasks receive a larger resilience margin.
-    resilience_margin = max(
-        60,
-        task["remaining"] * 0.25
-    )
-
-    # Start early enough that losing some future Focus Time
-    # does not immediately put the task at risk.
-    return (
-        task["remaining"]
-        >
-        max(
-            0,
-            future_capacity - resilience_margin
-        )
-    )
-
-
-def task_score(task, blocks, now):
-    urgency = deadline_urgency(
-        task["deadline"],
-        now
-    )
-
-    size_risk = min(
-        2.0,
-        task["remaining"] / 180.0
-    )
-
-    return (
-        urgency
-        * priority_multiplier(task["priority"])
-        + size_risk
-    )
+    return workload * MINUTES_PER_UNIT[unit]
 
 
 # ============================================================
-# TASK ALLOCATION DATABASE
+# SMALL TO-DO LISTS
 # ============================================================
 
-def allocation_properties(
-    schema,
-    name,
-    task_id,
-    focus_id,
-    minutes
-):
-    properties = {}
-
-    for property_name, definition in schema.items():
-
-        property_type = definition.get("type")
-
-        if (
-            property_name == "Name"
-            and property_type == "title"
-        ):
-            properties[property_name] = {
-                "title": [
-                    {
-                        "type": "text",
-                        "text": {
-                            "content": name
-                        }
-                    }
-                ]
-            }
-
-        elif (
-            property_name == "Master To-do list"
-            and property_type == "relation"
-        ):
-            properties[property_name] = {
-                "relation": [
-                    {
-                        "id": task_id
-                    }
-                ]
-            }
-
-        elif (
-            property_name == "Focus time"
-            and property_type == "relation"
-        ):
-            properties[property_name] = {
-                "relation": [
-                    {
-                        "id": focus_id
-                    }
-                ]
-            }
-
-        elif (
-            property_name == "Allocation"
-            and property_type == "number"
-        ):
-            properties[property_name] = {
-                "number": minutes
-            }
-
-        elif (
-            property_name == "Completion"
-            and property_type == "checkbox"
-        ):
-            properties[property_name] = {
-                "checkbox": False
-            }
-
-    return properties
+SOURCE_DATABASES = {
+    "ENL 248 To-Do": "ENL 248",
+    "COM 210 To-Do": "COM 210",
+    "LSAT To-Do": "LSAT",
+    "Independent Study To-Do": "Independent Study",
+    "JST To-Do": "JST",
+    "Reader To-Do": "Reader",
+    "PFS To-Do": "PFS",
+    "Personal To-Do": "Personal",
+    "Applications To-Do": "Applications",
+}
 
 
-def create_allocation(
-    data_source_id,
-    properties
-):
-    return notion(
-        "POST",
-        "/pages",
-        {
-            "parent": {
-                "type": "data_source_id",
-                "data_source_id": data_source_id
-            },
-            "properties": properties
-        }
-    )
+def read_small_tasks():
+    tasks = []
 
+    for database_name, project in SOURCE_DATABASES.items():
 
-def archive_page(page_id):
-    notion(
-        "PATCH",
-        f"/pages/{page_id}",
-        {
-            "in_trash": True
-        }
-    )
+        database_id = find_database(database_name)
+        data_source_id = get_data_source(database_id)
+
+        pages = query_data_source(data_source_id)
+
+        for page in pages:
+
+            if not checkbox_value(page, "Ready"):
+                continue
+
+            task_name = title_value(page, "Task")
+
+            if not task_name:
+                continue
+
+            tasks.append({
+                "source_page_id": page["id"],
+                "source_database": database_name,
+                "task": task_name,
+                "project": project,
+                "deadline": date_value(page, "Deadline"),
+                "workload": number_value(page, "Workload"),
+                "unit": select_value(page, "Unit"),
+                "priority": select_value(page, "Priority"),
+                "continuous": checkbox_value(page, "Continuous"),
+            })
+
+    for task in tasks:
+        task["minutes"] = workload_minutes(
+            task["workload"],
+            task["unit"],
+        )
+
+    return tasks
 
 
 # ============================================================
-# MAIN SCHEDULER
+# MASTER TO-DO LIST
 # ============================================================
 
-def main():
+def read_master_tasks():
+    database_id = find_database("Master To-Do List")
+    data_source_id = get_data_source(database_id)
 
-    now = datetime.now(TZ)
-
-    planning_end = (
-        now
-        + timedelta(days=HORIZON_DAYS)
-    )
-
-    status_end = (
-        now
-        + timedelta(days=STATUS_LOOKAHEAD_DAYS)
-    )
-
-    # --------------------------------------------------------
-    # Find the four databases
-    # --------------------------------------------------------
-
-    master_database = find_database(
-        "Master To-Do List"
-    )
-
-    focus_database = find_database(
-        "Focus time"
-    )
-
-    allocation_database = find_database(
-        "Task Allocations"
-    )
-
-    # --------------------------------------------------------
-    # Get their data sources
-    # --------------------------------------------------------
-
-    master_ds = get_data_source(
-        master_database
-    )
-
-    focus_ds = get_data_source(
-        focus_database
-    )
-
-    allocation_ds = get_data_source(
-        allocation_database
-    )
-
-    # --------------------------------------------------------
-    # Read everything
-    # --------------------------------------------------------
-
-    master_pages = all_pages(
-        master_ds
-    )
-
-    focus_pages = all_pages(
-        focus_ds
-    )
-
-    allocation_pages = all_pages(
-        allocation_ds
-    )
-
-    conversion_pages = all_pages(
-        conversion_ds
-    )
-
-    conversion_map = build_conversion_map(
-        conversion_pages
-    )
-
-    allocation_schema = get_schema(
-        allocation_ds
-    )
-
-    # --------------------------------------------------------
-    # Preserve completed allocation work
-    # --------------------------------------------------------
-
-    completed_minutes = {}
-
-    for allocation in allocation_pages:
-
-        if not checkbox_value(
-            allocation,
-            "Completion"
-        ):
-            continue
-
-        task_ids = relation_ids(
-            allocation,
-            "Master To-do list"
-        )
-
-        minutes = (
-            number_value(
-                allocation,
-                "Allocation"
-            )
-            or 0
-        )
-
-        for task_id in task_ids:
-
-            completed_minutes[task_id] = (
-                completed_minutes.get(
-                    task_id,
-                    0
-                )
-                + float(minutes)
-            )
-
-    # --------------------------------------------------------
-    # Remove old unfinished allocations
-    #
-    # Completed allocations stay permanently.
-    # Everything unfinished is regenerated from current data.
-    # --------------------------------------------------------
-
-    for allocation in allocation_pages:
-
-        if checkbox_value(
-            allocation,
-            "Completion"
-        ):
-            continue
-
-        archive_page(
-            allocation["id"]
-        )
-
-    # --------------------------------------------------------
-    # Build active task list
-    # --------------------------------------------------------
+    pages = query_data_source(data_source_id)
 
     tasks = []
 
-    for page in master_pages:
+    for page in pages:
 
-        if checkbox_value(
-            page,
-            "Completed"
-        ):
+        if checkbox_value(page, "Completed"):
             continue
 
-        total_minutes = calculate_task_minutes(
-            page,
-            conversion_map
+        task = {
+            "page_id": page["id"],
+            "task": title_value(page, "Task"),
+            "project": select_value(page, "Project"),
+            "deadline": date_value(page, "Deadline"),
+            "workload": number_value(page, "Workload"),
+            "unit": select_value(page, "Unit"),
+            "priority": select_value(page, "Priority level"),
+            "continuous": checkbox_value(page, "Continuous"),
+        }
+
+        task["minutes"] = workload_minutes(
+            task["workload"],
+            task["unit"],
         )
 
-        if (
-            total_minutes is None
-            or total_minutes <= 0
-        ):
-            continue
+        tasks.append(task)
 
-        remaining = max(
-            0.0,
-            total_minutes
-            - completed_minutes.get(
-                page["id"],
-                0
-            )
-        )
+    return tasks
 
-        if remaining <= 0:
-            continue
 
-        tasks.append(
-            {
-                "id": page["id"],
-                "name": title_value(
-                    page,
-                    "Task"
-                ),
-                "deadline": task_deadline(
-                    page
-                ),
-                "priority": text_value(
-                    page,
-                    "Priority Level"
-                ),
-                "unit": text_value(
-                    page,
-                    "Unit"
-                ),
-                "continuous": checkbox_value(
-                    page,
-                    "Continuous"
-                ),
-                "remaining": remaining,
-            }
-        )
+# ============================================================
+# FOCUS TIME
+# ============================================================
 
-    # --------------------------------------------------------
-    # Build available Focus Time blocks
-    # --------------------------------------------------------
+def read_focus_time():
+    database_id = find_database("Focus time")
+    data_source_id = get_data_source(database_id)
+
+    pages = query_data_source(data_source_id)
+
+    now = datetime.now(TZ)
+    horizon = now + timedelta(days=PLANNING_DAYS)
 
     blocks = []
 
-    for page in focus_pages:
+    for page in pages:
 
-        interval = focus_interval(
-            page
-        )
+        date = date_value(page, "Date")
 
-        if not interval:
+        if not date:
             continue
 
-        start, end = interval
+        start = date["start"]
+        end = date["end"]
+
+        if not end:
+            continue
 
         if end <= now:
             continue
 
-        if start > planning_end:
+        if start >= horizon:
             continue
 
-        start = max(
-            start,
-            now
+        if start < now:
+            start = now
+
+        if end > horizon:
+            end = horizon
+
+        minutes = int(
+            (end - start).total_seconds() / 60
         )
 
-        end = min(
-            end,
-            planning_end
-        )
-
-        if end <= start:
+        if minutes <= 0:
             continue
 
-        blocks.append(
-            {
-                "id": page["id"],
-                "start": start,
-                "end": end,
-            }
-        )
+        blocks.append({
+            "page_id": page["id"],
+            "start": start,
+            "end": end,
+            "remaining": minutes,
+        })
 
     blocks.sort(
         key=lambda block: block["start"]
     )
 
-    # --------------------------------------------------------
-    # Allocate work block by block
-    # --------------------------------------------------------
+    return blocks
 
-    created_allocations = 0
 
-    for block in blocks:
+# ============================================================
+# EXISTING TASK ALLOCATIONS
+# ============================================================
 
-        available = int(
-            (
-                block["end"]
-                - block["start"]
-            ).total_seconds() / 60
-        )
+def read_allocations():
+    database_id = find_database("Task Allocations")
+    data_source_id = get_data_source(database_id)
 
-        if available < MIN_CHUNK:
+    pages = query_data_source(data_source_id)
+
+    allocations = []
+
+    for page in pages:
+
+        allocations.append({
+            "page_id": page["id"],
+            "name": title_value(page, "Name"),
+            "focus_ids": relation_ids(
+                page,
+                "Focus time",
+            ),
+            "master_ids": relation_ids(
+                page,
+                "Master To-Do List",
+            ),
+            "allocation": number_value(
+                page,
+                "Allocation",
+            ) or 0,
+            "completed": checkbox_value(
+                page,
+                "Completion",
+            ),
+        })
+
+    return allocations
+
+
+def completed_minutes_by_task(allocations):
+    completed = {}
+
+    for allocation in allocations:
+
+        if not allocation["completed"]:
             continue
 
-        # Work that independently qualifies right now.
-        candidates = [
-            task
-            for task in tasks
-            if qualifies(
-                task,
-                blocks,
-                now
-            )
-            and task["remaining"] > 0
-        ]
+        for task_id in allocation["master_ids"]:
 
-        candidates.sort(
-            key=lambda task:
-                task_score(
-                    task,
-                    blocks,
-                    now
-                ),
-            reverse=True
-        )
-
-        # Prevent one task from monopolizing a block
-        # when multiple tasks qualify.
-        touched_this_block = set()
-
-        while (
-            available >= MIN_CHUNK
-            and candidates
-        ):
-
-            unused = [
-                task
-                for task in candidates
-                if (
-                    task["id"]
-                    not in touched_this_block
-                    and task["remaining"] > 0
-                )
-            ]
-
-            if not unused:
-
-                touched_this_block.clear()
-
-                unused = [
-                    task
-                    for task in candidates
-                    if task["remaining"] > 0
-                ]
-
-            if not unused:
-                break
-
-            task = max(
-                unused,
-                key=lambda item:
-                    task_score(
-                        item,
-                        blocks,
-                        now
-                    )
+            completed[task_id] = (
+                completed.get(task_id, 0)
+                + allocation["allocation"]
             )
 
-            # ------------------------------------------------
-            # Continuous tasks cannot be split.
-            # ------------------------------------------------
+    return completed
 
-            if task["continuous"]:
 
-                amount = int(
-                    math.ceil(
-                        task["remaining"]
-                    )
-                )
+# ============================================================
+# PFS WEEKLY TARGET
+# ============================================================
 
-                if amount > available:
-                    touched_this_block.add(
-                        task["id"]
-                    )
-                    continue
+def monday_of_week(date):
+    return date - timedelta(
+        days=date.weekday()
+    )
 
-            # ------------------------------------------------
-            # Normal tasks are allocated in natural units
-            # whenever possible.
-            # ------------------------------------------------
 
-            else:
+def pfs_week_start():
+    return monday_of_week(
+        datetime.now(TZ).date()
+    )
 
-                target = min(
-                    MAX_CHUNK,
-                    available,
-                    task["remaining"]
-                )
 
-                minutes_per_unit = (
-                    conversion_map.get(
-                        task["unit"],
-                        1
-                    )
-                )
+def pfs_allocated_minutes_this_week(
+    allocations,
+    master_tasks_by_id,
+):
+    week_start = pfs_week_start()
+    week_end = week_start + timedelta(days=7)
 
-                if (
-                    minutes_per_unit > 0
-                    and task["unit"]
-                    not in (
-                        "Hours",
-                        "Minutes"
-                    )
-                ):
+    total = 0
 
-                    units = int(
-                        target
-                        // minutes_per_unit
-                    )
+    for allocation in allocations:
 
-                    amount = int(
-                        units
-                        * minutes_per_unit
-                    )
+        for master_id in allocation["master_ids"]:
 
-                    # If one natural unit is itself
-                    # larger than 15 minutes, allow it.
-                    if (
-                        amount < MIN_CHUNK
-                        and minutes_per_unit <= available
-                    ):
-                        amount = int(
-                            minutes_per_unit
-                        )
+            task = master_tasks_by_id.get(master_id)
 
-                else:
-                    amount = int(target)
-
-            if (
-                amount <= 0
-                or amount > available
-            ):
-                touched_this_block.add(
-                    task["id"]
-                )
+            if not task:
                 continue
 
-            # ------------------------------------------------
-            # Create allocation
-            # ------------------------------------------------
+            if task["project"] != "PFS":
+                continue
 
-            display_name = allocation_name(
-                task["name"],
-                amount,
-                task["unit"],
-                conversion_map
+            for focus_id in allocation["focus_ids"]:
+                # Actual Focus Time dates are handled separately.
+                # This function is replaced by the dated version below.
+                pass
+
+    return total
+
+
+def pfs_minutes_from_allocations(
+    allocations,
+    focus_blocks_by_id,
+    master_tasks_by_id,
+):
+    week_start = pfs_week_start()
+    week_end = week_start + timedelta(days=7)
+
+    total = 0
+
+    for allocation in allocations:
+
+        for master_id in allocation["master_ids"]:
+
+            task = master_tasks_by_id.get(master_id)
+
+            if not task:
+                continue
+
+            if task["project"] != "PFS":
+                continue
+
+            for focus_id in allocation["focus_ids"]:
+
+                block = focus_blocks_by_id.get(
+                    focus_id
+                )
+
+                if not block:
+                    continue
+
+                date = block["start"].date()
+
+                if week_start <= date < week_end:
+                    total += allocation["allocation"]
+
+    return total
+
+
+# ============================================================
+# URGENCY
+# ============================================================
+
+def priority_multiplier(priority):
+    if priority == "High":
+        return 1.20
+
+    if priority == "Medium":
+        return 1.05
+
+    return 1.0
+
+
+def hours_until_deadline(task, now):
+    if not task["deadline"]:
+        return None
+
+    return (
+        task["deadline"]["start"] - now
+    ).total_seconds() / 3600
+
+
+def task_score(task, remaining_minutes, now):
+    hours = hours_until_deadline(
+        task,
+        now,
+    )
+
+    if hours is None:
+        deadline_score = 0.1
+
+    elif hours <= 0:
+        deadline_score = 100000
+
+    else:
+        deadline_score = (
+            100 / ((hours + 1) ** 2)
+        )
+
+    priority_score = priority_multiplier(
+        task["priority"]
+    )
+
+    size_score = min(
+        2.0,
+        remaining_minutes / 120,
+    )
+
+    return (
+        deadline_score
+        * priority_score
+        + size_score
+    )
+
+
+# ============================================================
+# ALLOCATION SIZE
+# ============================================================
+
+def choose_allocation_size(
+    task,
+    remaining_minutes,
+    available_minutes,
+):
+    maximum = min(
+        remaining_minutes,
+        available_minutes,
+    )
+
+    if maximum <= 0:
+        return 0
+
+    # Continuous tasks must fit entirely.
+    if task["continuous"]:
+
+        if remaining_minutes <= available_minutes:
+            return remaining_minutes
+
+        return 0
+
+    # Finish small remaining amounts.
+    if maximum <= PREFERRED_MAX_CHUNK_MINUTES:
+        return maximum
+
+    # Prefer 45-minute chunks.
+    chunk = PREFERRED_MAX_CHUNK_MINUTES
+
+    remainder = remaining_minutes - chunk
+
+    # Avoid creating a tiny final fragment.
+    if 0 < remainder < MIN_CHUNK_MINUTES:
+        return remaining_minutes
+
+    return chunk
+
+
+# ============================================================
+# GENERAL TASK SCHEDULING
+# ============================================================
+
+def schedule_general_tasks(
+    tasks,
+    focus_blocks,
+    completed_minutes,
+):
+    now = datetime.now(TZ)
+
+    remaining = {}
+
+    for task in tasks:
+
+        already_done = completed_minutes.get(
+            task["page_id"],
+            0,
+        )
+
+        remaining[task["page_id"]] = max(
+            0,
+            task["minutes"] - already_done,
+        )
+
+    allocations = []
+
+    for block in focus_blocks:
+
+        while block["remaining"] >= MIN_CHUNK_MINUTES:
+
+            candidates = []
+
+            for task in tasks:
+
+                rem = remaining[
+                    task["page_id"]
+                ]
+
+                if rem <= 0:
+                    continue
+
+                # PFS weekly-hours is handled separately.
+                if (
+                    task["project"] == "PFS"
+                    and task["task"] == PFS_TASK_NAME
+                ):
+                    continue
+
+                score = task_score(
+                    task,
+                    rem,
+                    now,
+                )
+
+                candidates.append(
+                    (score, task)
+                )
+
+            if not candidates:
+                break
+
+            candidates.sort(
+                key=lambda item: item[0],
+                reverse=True,
             )
 
-            properties = allocation_properties(
-                allocation_schema,
-                display_name,
-                task["id"],
-                block["id"],
-                amount
-            )
+            chosen = None
+            amount = 0
 
-            create_allocation(
-                allocation_ds,
-                properties
-            )
+            for _, task in candidates:
 
-            created_allocations += 1
+                amount = choose_allocation_size(
+                    task,
+                    remaining[
+                        task["page_id"]
+                    ],
+                    block["remaining"],
+                )
 
-            task["remaining"] -= amount
+                if amount > 0:
+                    chosen = task
+                    break
 
-            available -= amount
+            if chosen is None:
+                break
 
-            touched_this_block.add(
-                task["id"]
-            )
+            allocations.append({
+                "task": chosen,
+                "amount": amount,
+                "focus_page_id": block["page_id"],
+            })
 
-    # ========================================================
-    # CAPACITY / GO-STOP
-    # ========================================================
+            block["remaining"] -= amount
 
-    required_minutes = 0
+            remaining[
+                chosen["page_id"]
+            ] -= amount
+
+    return allocations, remaining
+
+
+# ============================================================
+# PFS SCHEDULING
+# ============================================================
+
+def schedule_pfs(
+    pfs_task,
+    focus_blocks,
+    existing_allocations,
+    master_tasks_by_id,
+):
+    """
+    PFS weekly hours is a Monday-Sunday target.
+
+    Individual PFS tasks count toward the weekly target.
+    Remaining target time is filled with the PFS weekly-hours
+    allocation.
+
+    PFS receives a slight preference, but does not displace
+    tasks with significantly more urgent deadlines.
+    """
+
+    week_start = pfs_week_start()
+    week_end = week_start + timedelta(days=7)
+
+    focus_blocks_by_id = {
+        block["page_id"]: block
+        for block in focus_blocks
+    }
+
+    already_allocated = (
+        pfs_minutes_from_allocations(
+            existing_allocations,
+            focus_blocks_by_id,
+            master_tasks_by_id,
+        )
+    )
+
+    remaining_target = max(
+        0,
+        PFS_WEEKLY_TARGET_MINUTES
+        - already_allocated,
+    )
+
+    if remaining_target <= 0:
+        return []
+
+    allocations = []
+
+    for block in focus_blocks:
+
+        if block["remaining"] <= 0:
+            continue
+
+        if block["start"].date() < week_start:
+            continue
+
+        if block["start"].date() >= week_end:
+            continue
+
+        amount = min(
+            block["remaining"],
+            remaining_target,
+        )
+
+        if amount < MIN_CHUNK_MINUTES:
+            continue
+
+        allocations.append({
+            "task": pfs_task,
+            "amount": amount,
+            "focus_page_id": block["page_id"],
+        })
+
+        block["remaining"] -= amount
+        remaining_target -= amount
+
+        if remaining_target <= 0:
+            break
+
+    return allocations
+
+
+# ============================================================
+# CREATE ALLOCATION
+# ============================================================
+
+def create_allocation(
+    allocation,
+    master_page_id,
+):
+    database_id = find_database(
+        "Task Allocations"
+    )
+
+    data_source_id = get_data_source(
+        database_id
+    )
+
+    task = allocation["task"]
+    amount = allocation["amount"]
+
+    unit = task["unit"]
+
+    if unit == "Hours":
+        display_amount = (
+            f"{amount / 60:g} hours"
+        )
+    elif unit:
+        display_amount = (
+            f"{amount:g} {unit}"
+        )
+    else:
+        display_amount = task["task"]
+
+    name = (
+        f'{task["task"]} — '
+        f'{display_amount}'
+    )
+
+    properties = {
+        "Name": {
+            "title": [
+                {
+                    "text": {
+                        "content": name
+                    }
+                }
+            ]
+        },
+        "Allocation": {
+            "number": amount
+        },
+        "Completion": {
+            "checkbox": False
+        },
+        "Master To-Do List": {
+            "relation": [
+                {
+                    "id": master_page_id
+                }
+            ]
+        },
+        "Focus time": {
+            "relation": [
+                {
+                    "id": allocation["focus_page_id"]
+                }
+            ]
+        },
+    }
+
+    return notion(
+        "POST",
+        "pages",
+        json={
+            "parent": {
+                "data_source_id": data_source_id
+            },
+            "properties": properties,
+        },
+    )
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+def calculate_status(
+    tasks,
+    remaining,
+    focus_blocks,
+):
+    now = datetime.now(TZ)
+
+    available = sum(
+        block["remaining"]
+        for block in focus_blocks
+    )
+
+    required = 0
+
+    for task in tasks:
+
+        rem = remaining.get(
+            task["page_id"],
+            0,
+        )
+
+        if rem <= 0:
+            continue
+
+        if not task["deadline"]:
+            continue
+
+        if (
+            task["deadline"]["start"]
+            <= now + timedelta(days=18)
+        ):
+            required += rem
+
+    difference = available - required
+
+    if difference >= 0:
+
+        hours = difference // 60
+        minutes = difference % 60
+
+        return (
+            f"🟢 On track — enough time available "
+            f"({hours}h {minutes}m surplus)"
+        )
+
+    shortfall = abs(difference)
+
+    hours = shortfall // 60
+    minutes = shortfall % 60
+
+    return (
+        f"🟠 Needs attention — "
+        f"{hours}h {minutes}m "
+        f"additional Focus Time needed"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("========================================")
+    print("        NOTION SCHEDULER")
+    print("========================================")
+    print()
+
+    print("Reading Ready tasks...")
+    small_tasks = read_small_tasks()
+
+    print(
+        f"Ready tasks found: {len(small_tasks)}"
+    )
+
+    print("Reading Master To-Do List...")
+    master_tasks = read_master_tasks()
+
+    print(
+        f"Master tasks found: {len(master_tasks)}"
+    )
+
+    # Match Master tasks to Ready tasks.
+    ready_keys = {
+        (
+            task["task"],
+            task["project"],
+        )
+        for task in small_tasks
+    }
+
+    tasks = [
+        task
+        for task in master_tasks
+        if (
+            task["task"],
+            task["project"],
+        ) in ready_keys
+    ]
+
+    print(
+        f"Schedulable tasks: {len(tasks)}"
+    )
+
+    print("Reading Focus time...")
+    focus_blocks = read_focus_time()
+
+    print(
+        f"Focus Time blocks: {len(focus_blocks)}"
+    )
+
+    print("Reading existing allocations...")
+    existing_allocations = read_allocations()
+
+    completed_minutes = (
+        completed_minutes_by_task(
+            existing_allocations
+        )
+    )
+
+    master_tasks_by_id = {
+        task["page_id"]: task
+        for task in master_tasks
+    }
+
+    # --------------------------------------------------------
+    # PFS
+    # --------------------------------------------------------
+
+    pfs_task = None
 
     for task in tasks:
 
         if (
-            task["deadline"]
-            and task["deadline"] <= status_end
+            task["project"] == "PFS"
+            and task["task"] == PFS_TASK_NAME
         ):
-            required_minutes += (
-                task["remaining"]
-            )
+            pfs_task = task
+            break
 
-    available_minutes = 0
+    pfs_allocations = []
 
-    for block in blocks:
+    if pfs_task:
 
-        available_minutes += int(
-            (
-                block["end"]
-                - block["start"]
-            ).total_seconds() / 60
-        )
+        print()
+        print("PFS weekly target: ACTIVE")
 
-    shortfall = max(
-        0,
-        math.ceil(
-            required_minutes
-            - available_minutes
-        )
-    )
-
-    # ========================================================
-    # GITHUB ACTIONS OUTPUT
-    # ========================================================
-
-    if shortfall:
-
-        hours, minutes = divmod(
-            shortfall,
-            60
+        pfs_allocations = schedule_pfs(
+            pfs_task,
+            focus_blocks,
+            existing_allocations,
+            master_tasks_by_id,
         )
 
         print(
-            f"STOP — {hours}h "
-            f"{minutes}m additional "
-            f"Focus Time needed."
+            f"PFS target allocations: "
+            f"{len(pfs_allocations)}"
         )
 
     else:
 
-        print(
-            "GO — enough Focus Time "
-            "for the current workload."
+        print()
+        print("PFS weekly target: INACTIVE")
+
+    # --------------------------------------------------------
+    # General tasks
+    # --------------------------------------------------------
+
+    general_tasks = [
+        task
+        for task in tasks
+        if not (
+            task["project"] == "PFS"
+            and task["task"] == PFS_TASK_NAME
         )
+    ]
 
-    print(
-        f"Active tasks: {len(tasks)}"
+    general_allocations, remaining = (
+        schedule_general_tasks(
+            general_tasks,
+            focus_blocks,
+            completed_minutes,
+        )
     )
 
-    print(
-        f"Focus Time blocks: {len(blocks)}"
+    all_new_allocations = (
+        general_allocations
+        + pfs_allocations
     )
 
+    # --------------------------------------------------------
+    # Write allocations
+    # --------------------------------------------------------
+
+    print()
     print(
         f"New allocations: "
-        f"{created_allocations}"
+        f"{len(all_new_allocations)}"
     )
+
+    for allocation in all_new_allocations:
+
+        create_allocation(
+            allocation,
+            allocation["task"]["page_id"],
+        )
+
+        print(
+            f"  {allocation['task']['task']} "
+            f"→ {allocation['amount']} "
+            f"{allocation['task']['unit']}"
+        )
+
+    # --------------------------------------------------------
+    # Status
+    # --------------------------------------------------------
+
+    status = calculate_status(
+        tasks,
+        remaining,
+        focus_blocks,
+    )
+
+    print()
+    print("----------------------------------------")
+    print(status)
+    print("----------------------------------------")
+    print()
+    print("Scheduler finished successfully.")
 
 
 if __name__ == "__main__":
