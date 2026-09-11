@@ -1,6 +1,8 @@
 import os
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
 import requests
 
 
@@ -19,6 +21,13 @@ PREFERRED_MAX_CHUNK_MINUTES = 45
 
 PFS_TASK_NAME = "PFS weekly hours"
 PFS_WEEKLY_TARGET_MINUTES = 30 * 60
+
+# Notion rate-limits API requests. This small delay between
+# allocation creations keeps us comfortably below the limit.
+CREATE_REQUEST_DELAY = 0.5
+
+# Maximum number of times to retry a rate-limited request.
+MAX_RATE_LIMIT_RETRIES = 5
 
 
 # ============================================================
@@ -58,13 +67,13 @@ def minutes_to_units(minutes, unit):
 
 def format_minutes(minutes):
     """
-    Human-readable time display.
+    Convert minutes to a human-readable time.
 
     Examples:
-        45 -> "45 minutes"
-        60 -> "1 hour"
-        90 -> "1 hour 30 minutes"
-        120 -> "2 hours"
+        45  -> 45 minutes
+        60  -> 1 hour
+        90  -> 1 hour 30 minutes
+        120 -> 2 hours
     """
 
     minutes = int(round(minutes))
@@ -81,10 +90,10 @@ def format_minutes(minutes):
             parts.append(f"{hours} hours")
 
     if remainder:
-        parts.append(
-            f"{remainder} minute"
-            + ("" if remainder == 1 else "s")
-        )
+        if remainder == 1:
+            parts.append("1 minute")
+        else:
+            parts.append(f"{remainder} minutes")
 
     if not parts:
         return "0 minutes"
@@ -94,10 +103,15 @@ def format_minutes(minutes):
 
 def format_allocation(amount_minutes, unit):
     """
-    Display an allocation in a natural, readable form.
+    Create the human-readable amount shown in the allocation name.
 
-    Time-based units are displayed as actual time.
-    Workload units remain in their natural units.
+    Time units become actual time:
+        0.75 Hours -> 45 minutes
+        1.5 Hours  -> 1 hour 30 minutes
+
+    Workload units remain natural units:
+        9 Pages
+        15 LSAT Questions
     """
 
     if unit in ("Hours", "Minutes"):
@@ -113,9 +127,7 @@ def format_allocation(amount_minutes, unit):
     else:
         amount_text = f"{amount:g}"
 
-    return (
-        f"{amount_text} {unit}"
-    )
+    return f"{amount_text} {unit}"
 
 
 # ============================================================
@@ -130,22 +142,77 @@ HEADERS = {
 
 
 def notion(method, path, **kwargs):
+    """
+    Make a Notion API request.
+
+    If Notion rate-limits us with HTTP 429, wait the amount
+    requested by Notion and retry automatically.
+    """
+
     url = f"https://api.notion.com/v1/{path}"
 
-    response = requests.request(
-        method,
-        url,
-        headers=HEADERS,
-        **kwargs,
-    )
+    for attempt in range(
+        MAX_RATE_LIMIT_RETRIES + 1
+    ):
 
-    if not response.ok:
+        response = requests.request(
+            method,
+            url,
+            headers=HEADERS,
+            **kwargs,
+        )
+
+        if response.ok:
+            return response.json()
+
+        if response.status_code == 429:
+
+            retry_after = 3
+
+            try:
+                data = response.json()
+                retry_after = int(
+                    data.get(
+                        "error",
+                        {}
+                    ).get(
+                        "additional_data",
+                        {}
+                    ).get(
+                        "retry_after",
+                        3,
+                    )
+                )
+            except Exception:
+                pass
+
+            if attempt >= MAX_RATE_LIMIT_RETRIES:
+                raise RuntimeError(
+                    "Notion API rate limit persisted "
+                    f"after {MAX_RATE_LIMIT_RETRIES} retries: "
+                    f"{response.text}"
+                )
+
+            print(
+                f"  Notion rate limit reached. "
+                f"Waiting {retry_after} seconds..."
+            )
+
+            time.sleep(
+                max(1, retry_after)
+            )
+
+            continue
+
         raise RuntimeError(
-            f"Notion API error {response.status_code}: "
+            f"Notion API error "
+            f"{response.status_code}: "
             f"{response.text}"
         )
 
-    return response.json()
+    raise RuntimeError(
+        "Notion API request failed."
+    )
 
 
 def search_all(query):
@@ -184,10 +251,6 @@ def find_database(name):
     """
     Find the actual Notion database whose title exactly
     matches the requested name.
-
-    Notion search may return data_source objects belonging
-    to linked database views, so we verify the parent
-    database's actual title before accepting it.
     """
 
     for obj in search_all(name):
@@ -196,7 +259,10 @@ def find_database(name):
 
             title = "".join(
                 item.get("plain_text", "")
-                for item in obj.get("title", [])
+                for item in obj.get(
+                    "title",
+                    [],
+                )
             ).strip()
 
             if title == name:
@@ -204,7 +270,11 @@ def find_database(name):
 
         elif obj.get("object") == "data_source":
 
-            parent = obj.get("parent", {})
+            parent = obj.get(
+                "parent",
+                {},
+            )
+
             database_id = parent.get(
                 "database_id"
             )
@@ -219,7 +289,10 @@ def find_database(name):
 
             title = "".join(
                 item.get("plain_text", "")
-                for item in database.get("title", [])
+                for item in database.get(
+                    "title",
+                    [],
+                )
             ).strip()
 
             if title == name:
@@ -231,6 +304,7 @@ def find_database(name):
 
 
 def get_data_source(database_id):
+
     data = notion(
         "GET",
         f"databases/{database_id}",
@@ -251,6 +325,7 @@ def get_data_source(database_id):
 
 
 def query_data_source(data_source_id):
+
     pages = []
     cursor = None
 
@@ -286,6 +361,7 @@ def query_data_source(data_source_id):
 # ============================================================
 
 def title_value(page, property_name):
+
     prop = page["properties"].get(
         property_name
     )
@@ -295,11 +371,15 @@ def title_value(page, property_name):
 
     return "".join(
         item.get("plain_text", "")
-        for item in prop.get("title", [])
+        for item in prop.get(
+            "title",
+            [],
+        )
     )
 
 
 def checkbox_value(page, property_name):
+
     prop = page["properties"].get(
         property_name
     )
@@ -314,6 +394,7 @@ def checkbox_value(page, property_name):
 
 
 def number_value(page, property_name):
+
     prop = page["properties"].get(
         property_name
     )
@@ -325,6 +406,7 @@ def number_value(page, property_name):
 
 
 def select_value(page, property_name):
+
     prop = page["properties"].get(
         property_name
     )
@@ -341,6 +423,7 @@ def select_value(page, property_name):
 
 
 def date_value(page, property_name):
+
     prop = page["properties"].get(
         property_name
     )
@@ -370,6 +453,7 @@ def date_value(page, property_name):
 
 
 def relation_ids(page, property_name):
+
     prop = page["properties"].get(
         property_name
     )
@@ -387,13 +471,16 @@ def relation_ids(page, property_name):
 
 
 def parse_datetime(value):
+
     if value.endswith("Z"):
         value = (
             value[:-1]
             + "+00:00"
         )
 
-    dt = datetime.fromisoformat(value)
+    dt = datetime.fromisoformat(
+        value
+    )
 
     if dt.tzinfo is None:
         dt = dt.replace(
@@ -452,24 +539,30 @@ def read_master_tasks():
         tasks.append({
             "page_id": page["id"],
             "task": name,
+
             "project": select_value(
                 page,
                 "Project",
             ),
+
             "deadline": date_value(
                 page,
                 "Deadline",
             ),
+
             "workload": workload,
             "unit": unit,
+
             "priority": select_value(
                 page,
                 "Priority level",
             ),
+
             "continuous": checkbox_value(
                 page,
                 "Continuous",
             ),
+
             "minutes": workload_to_minutes(
                 workload,
                 unit,
@@ -498,9 +591,12 @@ def read_focus_time():
     )
 
     now = datetime.now(TZ)
+
     horizon = (
         now
-        + timedelta(days=PLANNING_DAYS)
+        + timedelta(
+            days=PLANNING_DAYS
+        )
     )
 
     all_blocks = []
@@ -569,7 +665,10 @@ def read_focus_time():
             "remaining": minutes,
         })
 
-    return all_blocks, schedulable_blocks
+    return (
+        all_blocks,
+        schedulable_blocks,
+    )
 
 
 # ============================================================
@@ -596,22 +695,27 @@ def read_allocations():
 
         allocations.append({
             "page_id": page["id"],
+
             "name": title_value(
                 page,
                 "Name",
             ),
+
             "focus_ids": relation_ids(
                 page,
                 "Focus time",
             ),
+
             "master_ids": relation_ids(
                 page,
                 "Master To-Do List",
             ),
+
             "allocation": number_value(
                 page,
                 "Allocation",
             ) or 0,
+
             "completed": checkbox_value(
                 page,
                 "Completion",
@@ -629,6 +733,7 @@ def allocation_minutes(
     allocation,
     master_tasks_by_id,
 ):
+
     total = 0
 
     for master_id in allocation[
@@ -654,6 +759,7 @@ def calculate_existing_work(
     allocations,
     master_tasks_by_id,
 ):
+
     completed = {}
     planned = {}
 
@@ -688,7 +794,10 @@ def calculate_existing_work(
                     + minutes
                 )
 
-    return completed, planned
+    return (
+        completed,
+        planned,
+    )
 
 
 def reserve_existing_focus_time(
@@ -696,6 +805,7 @@ def reserve_existing_focus_time(
     focus_blocks,
     master_tasks_by_id,
 ):
+
     blocks_by_id = {
         block["page_id"]: block
         for block in focus_blocks
@@ -727,7 +837,8 @@ def reserve_existing_focus_time(
 
         block["remaining"] = max(
             0,
-            block["remaining"] - minutes,
+            block["remaining"]
+            - minutes,
         )
 
 
@@ -750,6 +861,7 @@ def hours_until_deadline(
     task,
     now,
 ):
+
     if not task["deadline"]:
         return None
 
@@ -764,6 +876,7 @@ def task_score(
     remaining_minutes,
     now,
 ):
+
     hours = hours_until_deadline(
         task,
         now,
@@ -811,6 +924,7 @@ def task_is_eligible(
     remaining_minutes,
     now,
 ):
+
     if remaining_minutes <= 0:
         return False
 
@@ -843,6 +957,7 @@ def choose_allocation_size(
     remaining_minutes,
     available_minutes,
 ):
+
     maximum = min(
         remaining_minutes,
         available_minutes,
@@ -891,6 +1006,7 @@ def schedule_general_tasks(
     completed,
     planned,
 ):
+
     now = datetime.now(TZ)
 
     remaining = {}
@@ -963,31 +1079,32 @@ def schedule_general_tasks(
                     now,
                 )
 
-                # Slightly favor work that has not
-                # already been scheduled earlier
-                # on the same day.
+                # Slightly discourage repeatedly
+                # scheduling the same task on the
+                # same day.
                 same_day_minutes = 0
 
                 for allocation in new_allocations:
 
                     if (
-                        allocation["task"]["page_id"]
+                        allocation[
+                            "task"
+                        ]["page_id"]
                         != task_id
                     ):
                         continue
 
-                    allocation_block = (
-                        next(
-                            (
-                                b
-                                for b in focus_blocks
-                                if b["page_id"]
-                                == allocation[
-                                    "focus_page_id"
-                                ]
-                            ),
-                            None,
-                        )
+                    allocation_block = next(
+                        (
+                            b
+                            for b in focus_blocks
+                            if b["page_id"]
+                            ==
+                            allocation[
+                                "focus_page_id"
+                            ]
+                        ),
+                        None,
                     )
 
                     if (
@@ -1009,14 +1126,18 @@ def schedule_general_tasks(
                     score *= 0.85
 
                 candidates.append(
-                    (score, task)
+                    (
+                        score,
+                        task,
+                    )
                 )
 
             if not candidates:
                 break
 
             candidates.sort(
-                key=lambda item: item[0],
+                key=lambda item:
+                item[0],
                 reverse=True,
             )
 
@@ -1025,12 +1146,14 @@ def schedule_general_tasks(
 
             for _, task in candidates:
 
-                amount = choose_allocation_size(
-                    task,
-                    remaining[
-                        task["page_id"]
-                    ],
-                    block["remaining"],
+                amount = (
+                    choose_allocation_size(
+                        task,
+                        remaining[
+                            task["page_id"]
+                        ],
+                        block["remaining"],
+                    )
                 )
 
                 if amount > 0:
@@ -1055,7 +1178,10 @@ def schedule_general_tasks(
                 chosen["page_id"]
             ] -= amount
 
-    return new_allocations, remaining
+    return (
+        new_allocations,
+        remaining,
+    )
 
 
 # ============================================================
@@ -1080,7 +1206,10 @@ def current_week_range():
         + timedelta(days=7)
     )
 
-    return monday, next_monday
+    return (
+        monday,
+        next_monday,
+    )
 
 
 def pfs_minutes_this_week(
@@ -1088,6 +1217,7 @@ def pfs_minutes_this_week(
     all_focus_blocks,
     master_tasks_by_id,
 ):
+
     week_start, week_end = (
         current_week_range()
     )
@@ -1156,6 +1286,7 @@ def schedule_pfs(
     all_focus_blocks,
     master_tasks_by_id,
 ):
+
     existing_minutes = (
         pfs_minutes_this_week(
             existing_allocations,
@@ -1225,6 +1356,7 @@ def schedule_pfs(
 def create_allocation(
     allocation,
 ):
+
     database_id = find_database(
         "Task Allocations"
     )
@@ -1251,9 +1383,6 @@ def create_allocation(
         f'{display_amount}'
     )
 
-    # The Unit property remains the task's
-    # underlying natural unit. The Name is the
-    # human-readable display.
     properties = {
         "Name": {
             "title": [
@@ -1301,16 +1430,24 @@ def create_allocation(
         },
     }
 
-    return notion(
+    result = notion(
         "POST",
         "pages",
         json={
             "parent": {
-                "data_source_id": data_source_id
+                "data_source_id":
+                    data_source_id
             },
             "properties": properties,
         },
     )
+
+    # Small pause after each successful creation.
+    time.sleep(
+        CREATE_REQUEST_DELAY
+    )
+
+    return result
 
 
 # ============================================================
@@ -1322,6 +1459,7 @@ def calculate_status(
     remaining,
     focus_blocks,
 ):
+
     now = datetime.now(TZ)
 
     available = sum(
@@ -1344,7 +1482,9 @@ def calculate_status(
         if not task["deadline"]:
             continue
 
-        deadline = task["deadline"]["start"]
+        deadline = task[
+            "deadline"
+        ]["start"]
 
         if (
             deadline
@@ -1353,7 +1493,8 @@ def calculate_status(
             required += rem
 
     difference = (
-        available - required
+        available
+        - required
     )
 
     if difference >= 0:
@@ -1376,16 +1517,24 @@ def calculate_status(
 
 def main():
 
-    print("========================================")
-    print("          NOTION SCHEDULER")
-    print("========================================")
+    print(
+        "========================================"
+    )
+    print(
+        "          NOTION SCHEDULER"
+    )
+    print(
+        "========================================"
+    )
     print()
 
     # --------------------------------------------------------
     # MASTER TASKS
     # --------------------------------------------------------
 
-    print("Reading Master To-Do List...")
+    print(
+        "Reading Master To-Do List..."
+    )
 
     tasks = read_master_tasks()
 
@@ -1398,11 +1547,14 @@ def main():
     # FOCUS TIME
     # --------------------------------------------------------
 
-    print("Reading Focus time...")
-
-    all_focus_blocks, focus_blocks = (
-        read_focus_time()
+    print(
+        "Reading Focus time..."
     )
+
+    (
+        all_focus_blocks,
+        focus_blocks,
+    ) = read_focus_time()
 
     print(
         f"Focus Time blocks found: "
@@ -1431,11 +1583,12 @@ def main():
         for task in tasks
     }
 
-    completed, planned = (
-        calculate_existing_work(
-            existing_allocations,
-            master_tasks_by_id,
-        )
+    (
+        completed,
+        planned,
+    ) = calculate_existing_work(
+        existing_allocations,
+        master_tasks_by_id,
     )
 
     reserve_existing_focus_time(
@@ -1489,13 +1642,14 @@ def main():
     # GENERAL TASKS
     # --------------------------------------------------------
 
-    general_allocations, remaining = (
-        schedule_general_tasks(
-            tasks,
-            focus_blocks,
-            completed,
-            planned,
-        )
+    (
+        general_allocations,
+        remaining,
+    ) = schedule_general_tasks(
+        tasks,
+        focus_blocks,
+        completed,
+        planned,
     )
 
     all_new_allocations = (
@@ -1515,10 +1669,6 @@ def main():
 
     for allocation in all_new_allocations:
 
-        create_allocation(
-            allocation
-        )
-
         task = allocation["task"]
 
         display_amount = format_allocation(
@@ -1529,6 +1679,10 @@ def main():
         print(
             f'  {task["task"]} → '
             f'{display_amount}'
+        )
+
+        create_allocation(
+            allocation
         )
 
     # --------------------------------------------------------
@@ -1542,10 +1696,15 @@ def main():
     )
 
     print()
-    print("----------------------------------------")
+    print(
+        "----------------------------------------"
+    )
     print(status)
-    print("----------------------------------------")
+    print(
+        "----------------------------------------"
+    )
     print()
+
     print(
         "Scheduler finished successfully."
     )
