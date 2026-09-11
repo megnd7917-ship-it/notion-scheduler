@@ -85,27 +85,28 @@ def search_all(query=""):
 
 
 def find_database(name):
-    matches = []
-
     for obj in search_all(name):
-        if obj.get("object") != "database":
-            continue
 
-        title = ""
+        if obj.get("object") == "data_source":
+            parent = obj.get("parent", {})
+            database_id = parent.get("database_id")
 
-        for item in obj.get("title", []):
-            if item.get("plain_text"):
-                title += item["plain_text"]
+            if database_id:
+                return database_id
 
-        if title.strip() == name:
-            matches.append(obj["id"])
+        elif obj.get("object") == "database":
+            title = ""
 
-    if not matches:
-        raise RuntimeError(
-            f'Could not find Notion database "{name}".'
-        )
+            for item in obj.get("title", []):
+                if item.get("plain_text"):
+                    title += item["plain_text"]
 
-    return matches[0]
+            if title.strip() == name:
+                return obj["id"]
+
+    raise RuntimeError(
+        f'Could not find Notion database "{name}".'
+    )
 
 
 def get_data_source(database_id):
