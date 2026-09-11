@@ -614,10 +614,6 @@ def main():
         "Task Allocations"
     )
 
-    conversion_database = find_database(
-        "Workload Conversions"
-    )
-
     # --------------------------------------------------------
     # Get their data sources
     # --------------------------------------------------------
@@ -632,10 +628,6 @@ def main():
 
     allocation_ds = get_data_source(
         allocation_database
-    )
-
-    conversion_ds = get_data_source(
-        conversion_database
     )
 
     # --------------------------------------------------------
