@@ -21,6 +21,20 @@ PLANNING_DAYS = 14
 MIN_CHUNK_MINUTES = 15
 PREFERRED_MAX_CHUNK_MINUTES = 45
 
+# Native Notion dependency property created by Database Settings >
+# More settings > Dependencies is normally named "Dependencies".
+DEPENDENCY_PROPERTY_NAMES = (
+    "Dependencies",
+    "Depends on",
+)
+
+# A prerequisite should be finished before the dependent task's
+# own work begins in earnest.  We therefore work backward from
+# the dependent's deadline, reserving:
+#   1) the dependent's remaining workload, and
+#   2) one full working day of breathing room.
+DEPENDENCY_BUFFER_WORKING_DAYS = 1
+
 PFS_TASK_NAME = "PFS weekly hours"
 PFS_PROJECT_NAME = "PFS"
 PFS_WEEKLY_TARGET_MINUTES = 30 * 60
@@ -296,6 +310,26 @@ def relation_ids(page, property_name):
     return [item["id"] for item in prop.get("relation", [])]
 
 
+def find_dependency_property_name(page):
+    properties = page.get("properties", {})
+
+    for preferred_name in DEPENDENCY_PROPERTY_NAMES:
+        if preferred_name in properties:
+            prop = properties[preferred_name]
+            if prop.get("type") == "relation":
+                return preferred_name
+
+    # Be forgiving about capitalization or a small naming variation.
+    for name, prop in properties.items():
+        if prop.get("type") != "relation":
+            continue
+        normalized = name.strip().lower()
+        if normalized in {"dependencies", "depends on", "dependency"}:
+            return name
+
+    return None
+
+
 def parse_datetime(value):
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
@@ -317,27 +351,47 @@ def read_master_tasks():
     pages = query_data_source(data_source_id)
 
     tasks = []
+    dependency_property_name = None
 
     for page in pages:
         name = title_value(page, "Task").strip()
         if not name:
             continue
 
+        page_dependency_property = find_dependency_property_name(page)
+        if page_dependency_property:
+            dependency_property_name = page_dependency_property
+
+        workload = number_value(page, "Workload")
+        unit = select_value(page, "Unit")
+
         tasks.append({
             "page_id": page["id"],
             "task": name,
             "project": select_value(page, "Project"),
             "deadline": date_value(page, "Deadline"),
-            "workload": number_value(page, "Workload"),
-            "unit": select_value(page, "Unit"),
+            "workload": workload,
+            "unit": unit,
             "priority": select_value(page, "Priority level"),
             "continuous": checkbox_value(page, "Continuous"),
             "completed": checkbox_value(page, "Completed"),
-            "minutes": workload_to_minutes(
-                number_value(page, "Workload"),
-                select_value(page, "Unit"),
-            ),
+            "minutes": workload_to_minutes(workload, unit),
+            "dependencies": relation_ids(
+                page,
+                page_dependency_property,
+            ) if page_dependency_property else [],
         })
+
+    if not dependency_property_name:
+        raise RuntimeError(
+            "The Master To-Do List does not have a native Notion "
+            "Dependencies relation yet. Turn on Database settings > "
+            "More settings > Dependencies, then run the scheduler again."
+        )
+
+    print(
+        f'Dependency property detected: "{dependency_property_name}"'
+    )
 
     return tasks
 
@@ -465,6 +519,12 @@ def calculate_completed_work(allocations, master_tasks_by_id):
     return completed
 
 
+def current_week_range():
+    today = datetime.now(TZ).date()
+    monday = today - timedelta(days=today.weekday())
+    return monday, monday + timedelta(days=7)
+
+
 def pfs_minutes_this_week(
     allocations,
     all_focus_blocks,
@@ -485,7 +545,15 @@ def pfs_minutes_this_week(
 
         for master_id in allocation["master_ids"]:
             task = master_tasks_by_id.get(master_id)
-            if task and task["project"] == PFS_PROJECT_NAME:
+            if not task:
+                continue
+
+            # The synthetic weekly-hours task is a scheduling target,
+            # not actual PFS work. It must never count toward itself.
+            if task["task"] == PFS_TASK_NAME:
+                continue
+
+            if task["project"] == PFS_PROJECT_NAME:
                 is_pfs = True
                 pfs_unit = task["unit"]
                 break
@@ -493,9 +561,8 @@ def pfs_minutes_this_week(
         if not is_pfs:
             continue
 
-        # The synthetic PFS weekly-hours task uses Hours.
         if pfs_unit not in MINUTES_PER_UNIT:
-            pfs_unit = "Hours"
+            continue
 
         for focus_id in allocation["focus_ids"]:
             block = blocks_by_id.get(focus_id)
@@ -512,10 +579,190 @@ def pfs_minutes_this_week(
     return total
 
 
-def current_week_range():
-    today = datetime.now(TZ).date()
-    monday = today - timedelta(days=today.weekday())
-    return monday, monday + timedelta(days=7)
+# ============================================================
+# DEPENDENCIES
+# ============================================================
+
+def build_dependency_graph(tasks):
+    tasks_by_id = {task["page_id"]: task for task in tasks}
+    dependents = {task["page_id"]: set() for task in tasks}
+
+    for task in tasks:
+        valid_dependencies = set()
+        for dependency_id in task["dependencies"]:
+            if dependency_id == task["page_id"]:
+                raise RuntimeError(
+                    f'Task "{task["task"]}" depends on itself.'
+                )
+
+            if dependency_id not in tasks_by_id:
+                print(
+                    f'Warning: dependency on an unavailable page was '
+                    f'ignored for "{task["task"]}".'
+                )
+                continue
+
+            valid_dependencies.add(dependency_id)
+            dependents[dependency_id].add(task["page_id"])
+
+        task["dependencies"] = sorted(valid_dependencies)
+
+    # Detect cycles before scheduling.
+    visiting = set()
+    visited = set()
+
+    def visit(task_id, path):
+        if task_id in visiting:
+            cycle_start = path.index(task_id)
+            cycle_ids = path[cycle_start:] + [task_id]
+            cycle_names = [tasks_by_id[i]["task"] for i in cycle_ids]
+            raise RuntimeError(
+                "Circular dependency detected: "
+                + " -> ".join(cycle_names)
+            )
+
+        if task_id in visited:
+            return
+
+        visiting.add(task_id)
+        for dependency_id in tasks_by_id[task_id]["dependencies"]:
+            visit(dependency_id, path + [dependency_id])
+        visiting.remove(task_id)
+        visited.add(task_id)
+
+    for task in tasks:
+        visit(task["page_id"], [task["page_id"]])
+
+    return tasks_by_id, dependents
+
+
+def subtract_working_days(dt, days):
+    result = dt
+    remaining_days = days
+
+    while remaining_days > 0:
+        result -= timedelta(days=1)
+        if result.weekday() < 5:
+            remaining_days -= 1
+
+    return result
+
+
+def dependency_buffer_for_task(task):
+    return timedelta(
+        days=DEPENDENCY_BUFFER_WORKING_DAYS
+    )
+
+
+def calculate_dependency_deadlines(tasks, remaining):
+    """
+    Work backward through dependency chains.
+
+    For a prerequisite A -> B, B's effective deadline becomes the
+    latest point at which B can still be comfortably completed. A's
+    effective deadline is then:
+
+        B effective deadline
+        - B remaining workload
+        - one full working day of buffer
+
+    The earliest constraint wins when a task has both its own deadline
+    and a downstream dependency deadline.
+    """
+    tasks_by_id, dependents = build_dependency_graph(tasks)
+
+    effective = {
+        task_id: task["deadline"]["start"]
+        if task["deadline"]
+        else None
+        for task_id, task in tasks_by_id.items()
+    }
+
+    visiting = set()
+
+    def solve(task_id):
+        if task_id in visiting:
+            raise RuntimeError("Circular dependency detected while calculating deadlines.")
+
+        visiting.add(task_id)
+
+        # First make sure all downstream constraints are known.
+        for dependent_id in dependents[task_id]:
+            solve(dependent_id)
+
+            dependent = tasks_by_id[dependent_id]
+            dependent_remaining = remaining.get(dependent_id, 0)
+
+            # A fully completed downstream task creates no future
+            # scheduling pressure.
+            if dependent["completed"] or dependent_remaining <= 0:
+                continue
+
+            downstream_deadline = effective.get(dependent_id)
+            if downstream_deadline is None:
+                continue
+
+            candidate = (
+                downstream_deadline
+                - timedelta(minutes=dependent_remaining)
+                - dependency_buffer_for_task(dependent)
+            )
+
+            own_deadline = effective.get(task_id)
+            if own_deadline is None or candidate < own_deadline:
+                effective[task_id] = candidate
+
+        visiting.remove(task_id)
+        return effective.get(task_id)
+
+    for task in tasks:
+        solve(task["page_id"])
+
+    for task in tasks:
+        task["effective_deadline"] = effective.get(task["page_id"])
+
+    return tasks_by_id, dependents
+
+
+def dependency_blocked(task, tasks_by_id, remaining):
+    if not task["dependencies"]:
+        return False
+
+    for dependency_id in task["dependencies"]:
+        dependency = tasks_by_id.get(dependency_id)
+        if not dependency:
+            continue
+
+        if dependency["completed"]:
+            continue
+
+        if remaining.get(dependency_id, dependency["minutes"]) <= 0:
+            continue
+
+        return True
+
+    return False
+
+
+def dependency_depth(task_id, tasks_by_id, cache=None):
+    if cache is None:
+        cache = {}
+
+    if task_id in cache:
+        return cache[task_id]
+
+    task = tasks_by_id[task_id]
+    if not task["dependencies"]:
+        cache[task_id] = 0
+        return 0
+
+    depth = 1 + max(
+        dependency_depth(dep_id, tasks_by_id, cache)
+        for dep_id in task["dependencies"]
+        if dep_id in tasks_by_id
+    )
+    cache[task_id] = depth
+    return depth
 
 
 # ============================================================
@@ -533,6 +780,7 @@ def stable_hash(value):
 
 
 def build_focus_fingerprint(all_focus_blocks):
+    horizon = datetime.now(TZ) + timedelta(days=PLANNING_DAYS)
     return stable_hash([
         (
             block["page_id"],
@@ -541,7 +789,7 @@ def build_focus_fingerprint(all_focus_blocks):
             block.get("last_edited_time"),
         )
         for block in all_focus_blocks
-        if block["start"] < datetime.now(TZ) + timedelta(days=PLANNING_DAYS)
+        if block["start"] < horizon
     ])
 
 
@@ -560,6 +808,7 @@ def build_master_fingerprint(tasks):
             task["priority"],
             task["continuous"],
             task["completed"],
+            tuple(sorted(task["dependencies"])),
         )
         for task in sorted(tasks, key=lambda t: t["page_id"])
     ])
@@ -637,22 +886,20 @@ def priority_multiplier(priority):
     return 1.00
 
 
-def hours_until_deadline(task, now):
-    if not task["deadline"]:
+def hours_until_effective_deadline(task, now):
+    deadline = task.get("effective_deadline")
+    if not deadline:
         return None
 
-    return (
-        task["deadline"]["start"] - now
-    ).total_seconds() / 3600
+    return (deadline - now).total_seconds() / 3600
 
 
-def task_score(task, remaining_minutes, now, same_day_minutes):
-    hours = hours_until_deadline(task, now)
+def task_score(task, remaining_minutes, now, same_day_minutes, dependency_depth_value):
+    hours = hours_until_effective_deadline(task, now)
 
     if hours is None:
         deadline_score = 0.1
     elif hours <= 0:
-        # Overdue tasks are handled as absolute-priority candidates.
         deadline_score = 100000000
     else:
         deadline_score = 100 / ((hours + 1) ** 2)
@@ -663,37 +910,61 @@ def task_score(task, remaining_minutes, now, same_day_minutes):
         + min(2.0, remaining_minutes / 120)
     )
 
+    # Dependencies create additional urgency, but the main driver is
+    # still the effective deadline calculated from downstream work.
+    if dependency_depth_value > 0:
+        score *= 1.0 + min(0.20, 0.05 * dependency_depth_value)
+
     if same_day_minutes > 0:
         score *= 0.85
 
     return score
 
 
-def task_is_eligible(task, remaining_minutes, block_start, block_end, now):
+def task_is_eligible(
+    task,
+    remaining_minutes,
+    block_start,
+    block_end,
+    now,
+    tasks_by_id,
+    remaining,
+):
     if remaining_minutes <= 0:
         return False
 
-    deadline = task["deadline"]
+    if task["completed"]:
+        return False
 
-    # No deadline: always eligible.
-    if not deadline:
+    # A dependent task cannot begin until all prerequisites are done.
+    if dependency_blocked(task, tasks_by_id, remaining):
+        return False
+
+    effective_deadline = task.get("effective_deadline")
+
+    # No actual or inherited deadline: eligible normally.
+    if not effective_deadline:
         return True
 
-    deadline_dt = deadline["start"]
-
-    # Overdue: absolute priority and eligible immediately.
-    if deadline_dt <= now:
+    # If the effective deadline has passed, the task becomes urgent.
+    if effective_deadline <= now:
         return True
 
-    # A task due today should only be left for deadline-day
-    # scheduling when it has <=15 minutes remaining.
-    if deadline_dt.date() == now.date():
+    # Preserve the existing deadline-day rule for the task's actual
+    # deadline. Dependency-derived deadlines are planning targets, so
+    # they remain schedulable right up to their barrier.
+    actual_deadline = task["deadline"]["start"] if task["deadline"] else None
+    if actual_deadline and actual_deadline.date() == now.date():
         if remaining_minutes > MIN_CHUNK_MINUTES:
             return False
 
-    # Hard deadline barrier: ordinary work cannot extend past
-    # the deadline.
-    if block_start >= deadline_dt:
+    # Never schedule work into or beyond the effective planning
+    # deadline unless that deadline has already become urgent.
+    if block_start >= effective_deadline:
+        return False
+
+    # Also preserve the actual hard deadline.
+    if actual_deadline and block_start >= actual_deadline:
         return False
 
     return True
@@ -709,11 +980,18 @@ def choose_allocation_size(
 ):
     maximum = min(remaining_minutes, available_minutes)
 
-    # Hard deadline barrier for non-overdue tasks.
+    # Hard barrier for both the task's own deadline and its
+    # dependency-derived planning deadline.
+    barriers = []
+    if task.get("effective_deadline") and task["effective_deadline"] > now:
+        barriers.append(task["effective_deadline"])
     if task["deadline"] and task["deadline"]["start"] > now:
-        deadline = task["deadline"]["start"]
+        barriers.append(task["deadline"]["start"])
+
+    if barriers:
+        earliest_barrier = min(barriers)
         deadline_capacity = int(
-            (deadline - block_start).total_seconds() / 60
+            (earliest_barrier - block_start).total_seconds() / 60
         )
         maximum = min(maximum, deadline_capacity)
 
@@ -725,14 +1003,12 @@ def choose_allocation_size(
             return remaining_minutes
         return 0
 
-    # Finish short tasks rather than fragmenting them.
     if maximum <= PREFERRED_MAX_CHUNK_MINUTES:
         return maximum
 
     chunk = PREFERRED_MAX_CHUNK_MINUTES
     remainder = remaining_minutes - chunk
 
-    # Avoid a useless 1–14 minute final fragment.
     if 0 < remainder <= MIN_CHUNK_MINUTES:
         return remaining_minutes
 
@@ -740,83 +1016,22 @@ def choose_allocation_size(
 
 
 # ============================================================
-# PFS SCHEDULING
+# PFS
 # ============================================================
 
 def pfs_score(block, remaining_target, week_end):
-    """
-    PFS has only a slight preference. Its pressure increases
-    as the week progresses, because the 30-hour minimum still
-    has to be reached by Sunday night.
-
-    Weekdays receive a modest preference over weekends.
-    """
     block_date = block["start"].date()
     is_weekday = block_date.weekday() < 5
 
-    today = datetime.now(TZ).date()
     days_left = max(1, (week_end - block_date).days)
 
-    # Base preference is deliberately modest.
     score = 0.35 if is_weekday else 0.20
-
-    # Increase pressure as the week closes.
     score += min(2.0, 7.0 / days_left)
 
-    # A large remaining deficit should matter, but not enough
-    # to override a genuinely urgent overdue task.
     deficit_hours = remaining_target / 60
     score += min(2.5, deficit_hours / 12)
 
     return score
-
-
-def schedule_pfs_candidates(
-    pfs_task,
-    focus_blocks,
-    remaining_target,
-    general_remaining,
-    new_allocations,
-    now,
-):
-    if remaining_target <= 0:
-        return remaining_target
-
-    week_start, week_end = current_week_range()
-
-    for block in focus_blocks:
-        if remaining_target < MIN_CHUNK_MINUTES:
-            break
-
-        date = block["start"].date()
-        if date < week_start or date >= week_end:
-            continue
-
-        if block["remaining"] < MIN_CHUNK_MINUTES:
-            continue
-
-        # PFS is competing with ordinary tasks. Only use this
-        # function for a block after ordinary scheduling has had
-        # the opportunity to place an urgent task.
-        amount = min(
-            block["remaining"],
-            remaining_target,
-            PREFERRED_MAX_CHUNK_MINUTES,
-        )
-
-        if amount < MIN_CHUNK_MINUTES:
-            continue
-
-        new_allocations.append({
-            "task": pfs_task,
-            "amount_minutes": amount,
-            "focus_page_id": block["page_id"],
-        })
-
-        block["remaining"] -= amount
-        remaining_target -= amount
-
-    return remaining_target
 
 
 # ============================================================
@@ -828,55 +1043,45 @@ def schedule_tasks(
     focus_blocks,
     completed,
     pfs_task,
+    completed_pfs_minutes,
 ):
     now = datetime.now(TZ)
 
     remaining = {}
-
     for task in tasks:
         if task["completed"]:
             continue
-
-        # PFS weekly-hours is not a normal workload task.
         if task["task"] == PFS_TASK_NAME:
             continue
 
         task_id = task["page_id"]
-        already_completed = completed.get(task_id, 0)
-
         remaining[task_id] = max(
             0,
-            task["minutes"] - already_completed,
+            task["minutes"] - completed.get(task_id, 0),
         )
+
+    tasks_by_id, _ = build_dependency_graph(tasks)
+    dependency_depth_cache = {}
+
+    calculate_dependency_deadlines(tasks, remaining)
+
+    for task in tasks:
+        depth = dependency_depth(task["page_id"], tasks_by_id, dependency_depth_cache)
+        task["dependency_depth"] = depth
+
+    pfs_remaining_target = max(
+        0,
+        PFS_WEEKLY_TARGET_MINUTES - completed_pfs_minutes,
+    )
 
     new_allocations = []
 
-    # The weekly PFS deficit is based on completed PFS work.
-    # At this point all incomplete old allocations have been
-    # removed, so there is no double-counting of provisional work.
-    if pfs_task:
-        # Caller provides this value through the task itself.
-        pass
-
-    week_start, week_end = current_week_range()
-
-    # We need the PFS target calculated before entering the block loop.
-    # Completed PFS minutes are stored by the caller as a special value.
-    pfs_completed_minutes = getattr(
-        schedule_tasks,
-        "_pfs_completed_minutes",
-        0,
-    )
-    pfs_remaining_target = max(
-        0,
-        PFS_WEEKLY_TARGET_MINUTES - pfs_completed_minutes,
-    )
-
     for block in focus_blocks:
+        excluded_for_block = set()
+
         while block["remaining"] >= MIN_CHUNK_MINUTES:
             candidates = []
 
-            # Ordinary tasks.
             for task in tasks:
                 if task["task"] == PFS_TASK_NAME:
                     continue
@@ -884,8 +1089,9 @@ def schedule_tasks(
                     continue
 
                 task_id = task["page_id"]
+                if task_id in excluded_for_block:
+                    continue
                 rem = remaining.get(task_id, 0)
-
                 if rem <= 0:
                     continue
 
@@ -895,51 +1101,58 @@ def schedule_tasks(
                     block["start"],
                     block["end"],
                     now,
+                    tasks_by_id,
+                    remaining,
                 ):
                     continue
 
-                same_day_minutes = sum(
-                    allocation["amount_minutes"]
-                    for allocation in new_allocations
-                    if allocation["task"]["page_id"] == task_id
-                    and next(
+                same_day_minutes = 0
+                for allocation in new_allocations:
+                    if allocation["task"]["page_id"] != task_id:
+                        continue
+
+                    allocation_block = next(
                         (
-                            b for b in focus_blocks
-                            if b["page_id"] == allocation["focus_page_id"]
+                            candidate_block
+                            for candidate_block in focus_blocks
+                            if candidate_block["page_id"]
+                            == allocation["focus_page_id"]
                         ),
-                        {"start": None},
-                    )["start"] is not None
-                    and next(
-                        (
-                            b for b in focus_blocks
-                            if b["page_id"] == allocation["focus_page_id"]
-                        ),
-                        {"start": None},
-                    )["start"].date() == block["start"].date()
-                )
+                        None,
+                    )
+
+                    if (
+                        allocation_block
+                        and allocation_block["start"].date()
+                        == block["start"].date()
+                    ):
+                        same_day_minutes += allocation["amount_minutes"]
 
                 score = task_score(
                     task,
                     rem,
                     now,
                     same_day_minutes,
+                    task.get("dependency_depth", 0),
                 )
 
                 candidates.append(("general", score, task))
 
-            # PFS candidate.
+            # PFS is deliberately only a slight preference. It competes
+            # with ordinary work and yields to genuinely urgent work.
             if (
                 pfs_task
                 and pfs_remaining_target >= MIN_CHUNK_MINUTES
-                and block["start"].date() < week_end
-                and block["start"].date() >= week_start
+                and current_week_range()[0]
+                <= block["start"].date()
+                < current_week_range()[1]
             ):
                 candidates.append((
                     "pfs",
                     pfs_score(
                         block,
                         pfs_remaining_target,
-                        week_end,
+                        current_week_range()[1],
                     ),
                     pfs_task,
                 ))
@@ -947,25 +1160,20 @@ def schedule_tasks(
             if not candidates:
                 break
 
-            # Absolute overdue tasks always beat everything else.
             overdue = [
                 candidate
                 for candidate in candidates
                 if (
                     candidate[0] == "general"
-                    and candidate[2]["deadline"]
-                    and candidate[2]["deadline"]["start"] <= now
+                    and candidate[2].get("effective_deadline")
+                    and candidate[2]["effective_deadline"] <= now
                 )
             ]
 
             if overdue:
                 candidates = overdue
 
-            candidates.sort(
-                key=lambda item: item[1],
-                reverse=True,
-            )
-
+            candidates.sort(key=lambda item: item[1], reverse=True)
             kind, _, chosen = candidates[0]
 
             if kind == "pfs":
@@ -998,9 +1206,10 @@ def schedule_tasks(
             )
 
             if amount <= 0:
-                # Remove this task from consideration for this
-                # block rather than getting stuck in a loop.
-                remaining[chosen["page_id"]] = 0
+                # The task cannot fit in this block before its current
+                # barrier. Temporarily exclude it from this block and
+                # let another eligible task use the available time.
+                excluded_for_block.add(chosen["page_id"])
                 continue
 
             new_allocations.append({
@@ -1026,16 +1235,11 @@ def create_allocation(allocation):
     task = allocation["task"]
     amount_minutes = allocation["amount_minutes"]
 
-    # Synthetic PFS weekly-hours allocations are always Hours.
     unit = task["unit"]
     if task["task"] == PFS_TASK_NAME:
         unit = "Hours"
 
-    display_amount = format_allocation(
-        amount_minutes,
-        unit,
-    )
-
+    display_amount = format_allocation(amount_minutes, unit)
     name = f'{task["task"]} — {display_amount}'
 
     properties = {
@@ -1099,12 +1303,10 @@ def calculate_status(tasks, remaining, focus_blocks):
 
     for task in tasks:
         rem = remaining.get(task["page_id"], 0)
-
         if rem <= 0 or not task["deadline"]:
             continue
 
         deadline = task["deadline"]["start"]
-
         if deadline <= now + timedelta(days=18):
             required += rem
 
@@ -1161,8 +1363,11 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
         master_tasks_by_id,
     )
 
-    # Completed PFS work is preserved as history and counts toward
-    # this week's 30-hour requirement.
+    # Validate the dependency graph before deleting provisional work.
+    build_dependency_graph(tasks)
+
+    # Completed PFS work is immutable history and counts toward the
+    # weekly target. The synthetic PFS weekly-hours task does not count.
     completed_pfs_minutes = 0
     for allocation in allocations:
         if not allocation["completed"]:
@@ -1170,19 +1375,18 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
 
         for master_id in allocation["master_ids"]:
             task = master_tasks_by_id.get(master_id)
-            if task and task["project"] == PFS_PROJECT_NAME:
+            if not task or task["task"] == PFS_TASK_NAME:
+                continue
+
+            if task["project"] == PFS_PROJECT_NAME:
                 completed_pfs_minutes += workload_to_minutes(
                     allocation["allocation"],
-                    task["unit"] if task["unit"] in MINUTES_PER_UNIT else "Hours",
+                    task["unit"],
                 )
                 break
 
-    # Remove all incomplete allocations. Completed allocations are
-    # never modified.
     delete_incomplete_allocations(allocations)
 
-    # PFS weekly-hours activates only when the exact task exists
-    # on Master To-Do List.
     pfs_task = next(
         (
             task for task in tasks
@@ -1192,13 +1396,25 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
         None,
     )
 
-    schedule_tasks._pfs_completed_minutes = completed_pfs_minutes
+    if pfs_task:
+        print("PFS weekly target: ACTIVE")
+        print(
+            "Completed PFS time this week: "
+            f"{format_minutes(completed_pfs_minutes)}"
+        )
+        print(
+            "PFS time still needed: "
+            f"{format_minutes(max(0, PFS_WEEKLY_TARGET_MINUTES - completed_pfs_minutes))}"
+        )
+    else:
+        print("PFS weekly target: INACTIVE")
 
     new_allocations, remaining = schedule_tasks(
         tasks,
         focus_blocks,
         completed,
         pfs_task,
+        completed_pfs_minutes,
     )
 
     print(
@@ -1269,15 +1485,15 @@ def main():
         "completed_allocations": completed_allocation_fingerprint,
     }
 
-    force_rebuild = os.environ.get("FORCE_REBUILD", "").lower() == "true"
+    force_rebuild = (
+        os.environ.get("FORCE_REBUILD", "").lower() == "true"
+    )
 
     changed = (
         current_inputs != {
             "focus": state.get("focus"),
             "master": state.get("master"),
-            "completed_allocations": state.get(
-                "completed_allocations"
-            ),
+            "completed_allocations": state.get("completed_allocations"),
         }
     )
 
@@ -1292,8 +1508,7 @@ def main():
         print("Relevant scheduling changes detected.")
 
     # Never rebuild while inside an active Focus Time block.
-    # Crucially, we do NOT update the saved input state here.
-    # That means the next run will try again after the block ends.
+    # Do not save the state here; the next run will retry.
     if should_defer_rebuild(all_focus_blocks):
         return
 
@@ -1304,7 +1519,6 @@ def main():
         allocations,
     )
 
-    # Save only after a successful rebuild.
     save_state(current_inputs)
 
     print("Scheduler finished successfully.")
