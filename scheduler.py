@@ -21,12 +21,10 @@ PLANNING_DAYS = 14
 MIN_CHUNK_MINUTES = 15
 PREFERRED_MAX_CHUNK_MINUTES = 45
 
-# Native Notion dependency property created by Database Settings >
-# More settings > Dependencies is normally named "Dependencies".
-DEPENDENCY_PROPERTY_NAMES = (
-    "Dependencies",
-    "Depends on",
-)
+# Existing Notion dependency relation maintained by the user's
+# Notion automation. The scheduler reads the prerequisites from this
+# property; it does not create or modify dependency relationships.
+DEPENDENCY_PROPERTY_NAME = "Blocked by"
 
 # A prerequisite should be finished before the dependent task's
 # own work begins in earnest.  We therefore work backward from
@@ -311,21 +309,19 @@ def relation_ids(page, property_name):
 
 
 def find_dependency_property_name(page):
+    """Return the authoritative dependency relation property name.
+
+    The user's Notion automation maintains the native dependency
+    relationship through the "Blocked by" relation. The GitHub
+    scheduler only needs the upstream/prerequisite side of that
+    relationship, so it reads "Blocked by" and does not maintain a
+    second dependency relation of its own.
+    """
     properties = page.get("properties", {})
+    prop = properties.get(DEPENDENCY_PROPERTY_NAME)
 
-    for preferred_name in DEPENDENCY_PROPERTY_NAMES:
-        if preferred_name in properties:
-            prop = properties[preferred_name]
-            if prop.get("type") == "relation":
-                return preferred_name
-
-    # Be forgiving about capitalization or a small naming variation.
-    for name, prop in properties.items():
-        if prop.get("type") != "relation":
-            continue
-        normalized = name.strip().lower()
-        if normalized in {"dependencies", "depends on", "dependency"}:
-            return name
+    if prop and prop.get("type") == "relation":
+        return DEPENDENCY_PROPERTY_NAME
 
     return None
 
@@ -351,7 +347,7 @@ def read_master_tasks():
     pages = query_data_source(data_source_id)
 
     tasks = []
-    dependency_property_name = None
+    dependency_property_found = False
 
     for page in pages:
         name = title_value(page, "Task").strip()
@@ -360,7 +356,7 @@ def read_master_tasks():
 
         page_dependency_property = find_dependency_property_name(page)
         if page_dependency_property:
-            dependency_property_name = page_dependency_property
+            dependency_property_found = True
 
         workload = number_value(page, "Workload")
         unit = select_value(page, "Unit")
@@ -382,15 +378,16 @@ def read_master_tasks():
             ) if page_dependency_property else [],
         })
 
-    if not dependency_property_name:
+    if not dependency_property_found:
         raise RuntimeError(
-            "The Master To-Do List does not have a native Notion "
-            "Dependencies relation yet. Turn on Database settings > "
-            "More settings > Dependencies, then run the scheduler again."
+            'The Master To-Do List does not have the required "Blocked by" '
+            'relation. The scheduler expects "Blocked by" to be a relation '
+            'to the Master To-Do List, maintained by your Notion automation.'
         )
 
     print(
-        f'Dependency property detected: "{dependency_property_name}"'
+        f'Dependency property detected: "{DEPENDENCY_PROPERTY_NAME}" '
+        '(reading prerequisites from Notion automation)'
     )
 
     return tasks
