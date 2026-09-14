@@ -1397,7 +1397,7 @@ def calculate_completed_pfs_minutes(allocations, master_tasks_by_id):
 
 
 def update_schedule_status(tasks, allocations, focus_blocks):
-    """Update the single Current Schedule page in the Schedule Status database."""
+    """Update the single Current Schedule page and read its controls."""
     master_tasks_by_id = {
         task["page_id"]: task
         for task in tasks
@@ -1438,10 +1438,10 @@ def update_schedule_status(tasks, allocations, focus_blocks):
 
     now = datetime.now(TZ)
 
-    # Notion can display long property names in truncated form.  Resolve
-    # the actual property names from the Current Schedule page before
-    # sending the update, so a harmless naming difference does not cause
-    # the entire scheduler run to fail.
+    # Resolve property names from the actual page returned by Notion.
+    # This keeps the scheduler tolerant of capitalization/spelling
+    # differences while still failing clearly if a required property is
+    # genuinely missing.
     actual_property_names = set(
         current_schedule_page.get("properties", {}).keys()
     )
@@ -1459,13 +1459,10 @@ def update_schedule_status(tasks, allocations, focus_blocks):
 
         expected_normalized = normalize(expected_name)
 
-        # First allow harmless differences in capitalization/spaces.
         for actual_name in actual_property_names:
             if normalize(actual_name) == expected_normalized:
                 return actual_name
 
-        # Then allow the visible property to contain a longer suffix,
-        # e.g. "PFS Weekly Target Remaining".
         for actual_name in actual_property_names:
             actual_normalized = normalize(actual_name)
             if actual_normalized.startswith(expected_normalized):
@@ -1479,9 +1476,16 @@ def update_schedule_status(tasks, allocations, focus_blocks):
 
     status_property = resolve_status_property("Status")
     deadline_property = resolve_status_property("Near-Term Deadline Work")
-    pfs_property = resolve_status_property("PFS Weekly Target")
+    pfs_property = resolve_status_property("PFS Weekly Target Remaining")
     capacity_property = resolve_status_property("Schedule Capacity")
+    difference_property = resolve_status_property("Schedule difference")
     updated_property = resolve_status_property("Last Updated")
+    reconsider_property = resolve_status_property("Reconsider")
+
+    reconsider_requested = checkbox_value(
+        current_schedule_page,
+        reconsider_property,
+    )
 
     properties = {
         status_property: {
@@ -1517,6 +1521,18 @@ def update_schedule_status(tasks, allocations, focus_blocks):
                 },
             }]
         },
+        difference_property: {
+            "rich_text": [{
+                "type": "text",
+                "text": {
+                    "content": (
+                        f"+{format_minutes(status_info['difference'])} surplus"
+                        if status_info["difference"] >= 0
+                        else f"-{format_minutes(abs(status_info['difference']))} needed"
+                    )
+                },
+            }]
+        },
         updated_property: {
             "date": {
                 "start": now.isoformat(),
@@ -1530,10 +1546,39 @@ def update_schedule_status(tasks, allocations, focus_blocks):
         json={"properties": properties},
     )
 
+    if reconsider_requested:
+        print("Reconsider request detected on Current Schedule.")
+
     print("Schedule Status updated in Notion.")
     print(f"  Status: {status_info['status_detail']}")
+    print(
+        "  Schedule difference: "
+        f"{format_minutes(abs(status_info['difference']))} "
+        f"{'surplus' if status_info['difference'] >= 0 else 'needed'}"
+    )
 
-    return status_info
+    return {
+        "status_info": status_info,
+        "page_id": current_schedule_page["id"],
+        "reconsider_requested": reconsider_requested,
+        "reconsider_property": reconsider_property,
+    }
+
+
+def clear_reconsider_request(page_id, property_name):
+    """Clear Reconsider only after a requested rebuild succeeds."""
+    notion(
+        "PATCH",
+        f"pages/{page_id}",
+        json={
+            "properties": {
+                property_name: {
+                    "checkbox": False,
+                }
+            }
+        },
+    )
+    print("Reconsider request completed; Reconsider reset to unchecked.")
 
 
 # ============================================================
@@ -1675,8 +1720,14 @@ def main():
 
     # The Schedule Status page is a separate Notion database from the
     # Daily Plan. Update it every run so the displayed capacity stays
-    # current even when no schedule rebuild is needed.
-    update_schedule_status(tasks, allocations, focus_blocks)
+    # current even when no schedule rebuild is needed. The page also
+    # contains the explicit Reconsider control.
+    schedule_status = update_schedule_status(
+        tasks,
+        allocations,
+        focus_blocks,
+    )
+    reconsider_requested = schedule_status["reconsider_requested"]
 
     state = load_state()
 
@@ -1704,19 +1755,24 @@ def main():
         }
     )
 
-    if not force_rebuild and not changed:
+    if not force_rebuild and not changed and not reconsider_requested:
         print("No relevant changes detected.")
         print("Scheduler finished without changing the Daily Plan.")
         return
 
-    if force_rebuild:
+    if reconsider_requested:
+        print("Explicit Reconsider request: rebuilding now.")
+    elif force_rebuild:
         print("Forced rebuild requested.")
     else:
         print("Relevant scheduling changes detected.")
 
-    # Never rebuild while inside an active Focus Time block.
-    # Do not save the state here; the next run will retry.
-    if should_defer_rebuild(all_focus_blocks):
+    # Normal automatic rebuilds do not churn the active Focus Time block.
+    # An explicit Reconsider request is different: it intentionally
+    # overrides that protection. read_focus_time() has already clipped an
+    # active block's start to NOW, so the rebuild sees only the remaining
+    # future portion of the current block.
+    if not reconsider_requested and should_defer_rebuild(all_focus_blocks):
         return
 
     rebuild(
@@ -1727,6 +1783,15 @@ def main():
     )
 
     save_state(current_inputs)
+
+    # Only clear the button's request after the entire rebuild and state
+    # save have succeeded. If anything fails, the checkbox remains checked
+    # so the request is not silently lost.
+    if reconsider_requested:
+        clear_reconsider_request(
+            schedule_status["page_id"],
+            schedule_status["reconsider_property"],
+        )
 
     print("Scheduler finished successfully.")
 
