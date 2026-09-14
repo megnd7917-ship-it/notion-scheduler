@@ -1438,11 +1438,56 @@ def update_schedule_status(tasks, allocations, focus_blocks):
 
     now = datetime.now(TZ)
 
+    # Notion can display long property names in truncated form.  Resolve
+    # the actual property names from the Current Schedule page before
+    # sending the update, so a harmless naming difference does not cause
+    # the entire scheduler run to fail.
+    actual_property_names = set(
+        current_schedule_page.get("properties", {}).keys()
+    )
+
+    def resolve_status_property(expected_name):
+        if expected_name in actual_property_names:
+            return expected_name
+
+        def normalize(name):
+            return "".join(
+                character.lower()
+                for character in name
+                if character.isalnum()
+            )
+
+        expected_normalized = normalize(expected_name)
+
+        # First allow harmless differences in capitalization/spaces.
+        for actual_name in actual_property_names:
+            if normalize(actual_name) == expected_normalized:
+                return actual_name
+
+        # Then allow the visible property to contain a longer suffix,
+        # e.g. "PFS Weekly Target Remaining".
+        for actual_name in actual_property_names:
+            actual_normalized = normalize(actual_name)
+            if actual_normalized.startswith(expected_normalized):
+                return actual_name
+
+        available = ", ".join(sorted(actual_property_names))
+        raise RuntimeError(
+            f'Could not find Schedule Status property "{expected_name}". '
+            f'Available properties are: {available}'
+        )
+
+    status_property = resolve_status_property("Status")
+    deadline_property = resolve_status_property("Near-Term Deadline Work")
+    pfs_property = resolve_status_property("PFS Weekly Target")
+    capacity_property = resolve_status_property("Schedule Capacity")
+    updated_property = resolve_status_property("Last Updated")
+
     properties = {
-        "Status": {
+        status_property: {
             "select": {"name": status_info["status"]}
         },
-        "Near-Term Deadline Work": {
+        deadline_property: {
             "rich_text": [{
                 "type": "text",
                 "text": {
@@ -1452,7 +1497,7 @@ def update_schedule_status(tasks, allocations, focus_blocks):
                 },
             }]
         },
-        "PFS Weekly Target": {
+        pfs_property: {
             "rich_text": [{
                 "type": "text",
                 "text": {
@@ -1464,7 +1509,7 @@ def update_schedule_status(tasks, allocations, focus_blocks):
                 },
             }]
         },
-        "Schedule Capacity": {
+        capacity_property: {
             "rich_text": [{
                 "type": "text",
                 "text": {
@@ -1472,7 +1517,7 @@ def update_schedule_status(tasks, allocations, focus_blocks):
                 },
             }]
         },
-        "Last Updated": {
+        updated_property: {
             "date": {
                 "start": now.isoformat(),
             }
