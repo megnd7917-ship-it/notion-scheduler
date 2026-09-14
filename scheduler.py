@@ -721,7 +721,7 @@ def calculate_dependency_deadlines(tasks, remaining):
     return tasks_by_id, dependents
 
 
-def dependency_blocked(task, tasks_by_id, remaining):
+def dependency_blocked(task, tasks_by_id, completed, remaining):
     if not task["dependencies"]:
         return False
 
@@ -730,10 +730,15 @@ def dependency_blocked(task, tasks_by_id, remaining):
         if not dependency:
             continue
 
+        # A dependency is satisfied only by ACTUAL completed work,
+        # not merely because the prerequisite has been allocated in the
+        # new schedule. This prevents a dependent task from being placed
+        # in the same rebuild before its prerequisite is actually done.
         if dependency["completed"]:
             continue
 
-        if remaining.get(dependency_id, dependency["minutes"]) <= 0:
+        completed_minutes = completed.get(dependency_id, 0)
+        if completed_minutes >= dependency["minutes"]:
             continue
 
         return True
@@ -925,6 +930,7 @@ def task_is_eligible(
     block_end,
     now,
     tasks_by_id,
+    completed,
     remaining,
 ):
     if remaining_minutes <= 0:
@@ -934,7 +940,7 @@ def task_is_eligible(
         return False
 
     # A dependent task cannot begin until all prerequisites are done.
-    if dependency_blocked(task, tasks_by_id, remaining):
+    if dependency_blocked(task, tasks_by_id, completed, remaining):
         return False
 
     effective_deadline = task.get("effective_deadline")
@@ -1099,6 +1105,7 @@ def schedule_tasks(
                     block["end"],
                     now,
                     tasks_by_id,
+                    completed,
                     remaining,
                 ):
                     continue
@@ -1288,38 +1295,200 @@ def create_allocation(allocation):
 # STATUS
 # ============================================================
 
-def calculate_status(tasks, remaining, focus_blocks):
+def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
+    """Calculate schedule sufficiency before scheduling consumes capacity."""
     now = datetime.now(TZ)
 
-    available = sum(
-        block["remaining"]
-        for block in focus_blocks
-    )
+    available = sum(block["remaining"] for block in focus_blocks)
 
-    required = 0
+    deadline_required = 0
+    total_remaining = 0
 
     for task in tasks:
-        rem = remaining.get(task["page_id"], 0)
-        if rem <= 0 or not task["deadline"]:
+        if task["completed"] or task["task"] == PFS_TASK_NAME:
             continue
 
-        deadline = task["deadline"]["start"]
-        if deadline <= now + timedelta(days=18):
-            required += rem
+        rem = max(0, task["minutes"] - completed.get(task["page_id"], 0))
+        if rem <= 0:
+            continue
 
+        total_remaining += rem
+
+        if task["deadline"]:
+            deadline = task["deadline"]["start"]
+            if deadline <= now + timedelta(days=18):
+                deadline_required += rem
+
+    pfs_required = 0
+    pfs_task_active = any(
+        task["task"] == PFS_TASK_NAME and not task["completed"]
+        for task in tasks
+    )
+    if pfs_task_active:
+        pfs_required = max(
+            0,
+            PFS_WEEKLY_TARGET_MINUTES - completed_pfs_minutes,
+        )
+
+    required = deadline_required + pfs_required
     difference = available - required
 
     if difference >= 0:
-        return (
+        status = "🟢 On track"
+        status_detail = (
             "🟢 On track — enough time available "
             f"({format_minutes(difference)} surplus)"
         )
+    else:
+        status = "🟠 Needs attention"
+        status_detail = (
+            "🟠 Needs attention — "
+            f"{format_minutes(abs(difference))} "
+            "additional Focus Time needed"
+        )
 
-    return (
-        "🟠 Needs attention — "
-        f"{format_minutes(abs(difference))} "
-        "additional Focus Time needed"
+    print(
+        f"Schedule capacity: {format_minutes(available)} Focus Time available"
     )
+    print(
+        f"Near-term deadline work: {format_minutes(deadline_required)} required"
+    )
+    if pfs_task_active:
+        print(
+            f"PFS weekly target remaining: {format_minutes(pfs_required)}"
+        )
+    print(
+        f"Total remaining task work: {format_minutes(total_remaining)}"
+    )
+
+    return {
+        "status": status,
+        "status_detail": status_detail,
+        "available": available,
+        "deadline_required": deadline_required,
+        "pfs_required": pfs_required,
+        "total_remaining": total_remaining,
+        "difference": difference,
+        "pfs_active": pfs_task_active,
+    }
+
+
+def calculate_completed_pfs_minutes(allocations, master_tasks_by_id):
+    """Return completed PFS project time for the current week."""
+    completed_pfs_minutes = 0
+
+    for allocation in allocations:
+        if not allocation["completed"]:
+            continue
+
+        for master_id in allocation["master_ids"]:
+            task = master_tasks_by_id.get(master_id)
+            if not task or task["task"] == PFS_TASK_NAME:
+                continue
+
+            if task["project"] == PFS_PROJECT_NAME:
+                completed_pfs_minutes += workload_to_minutes(
+                    allocation["allocation"],
+                    task["unit"],
+                )
+                break
+
+    return completed_pfs_minutes
+
+
+def update_schedule_status(tasks, allocations, focus_blocks):
+    """Update the single Current Schedule page in the Schedule Status database."""
+    master_tasks_by_id = {
+        task["page_id"]: task
+        for task in tasks
+    }
+
+    completed = calculate_completed_work(
+        allocations,
+        master_tasks_by_id,
+    )
+    completed_pfs_minutes = calculate_completed_pfs_minutes(
+        allocations,
+        master_tasks_by_id,
+    )
+
+    status_info = calculate_status(
+        tasks,
+        completed,
+        focus_blocks,
+        completed_pfs_minutes,
+    )
+
+    database_id = find_database("Schedule Status")
+    data_source_id = get_data_source(database_id)
+    pages = query_data_source(data_source_id)
+
+    current_schedule_page = None
+    for page in pages:
+        name = title_value(page, "Name").strip()
+        if name == "Current Schedule":
+            current_schedule_page = page
+            break
+
+    if not current_schedule_page:
+        raise RuntimeError(
+            'Could not find the "Current Schedule" page in the '
+            '"Schedule Status" database.'
+        )
+
+    now = datetime.now(TZ)
+
+    properties = {
+        "Status": {
+            "select": {"name": status_info["status"]}
+        },
+        "Near-Term Deadline Work": {
+            "rich_text": [{
+                "type": "text",
+                "text": {
+                    "content": format_minutes(
+                        status_info["deadline_required"]
+                    )
+                },
+            }]
+        },
+        "PFS Weekly Target": {
+            "rich_text": [{
+                "type": "text",
+                "text": {
+                    "content": (
+                        format_minutes(status_info["pfs_required"])
+                        if status_info["pfs_active"]
+                        else "Inactive"
+                    )
+                },
+            }]
+        },
+        "Schedule Capacity": {
+            "rich_text": [{
+                "type": "text",
+                "text": {
+                    "content": format_minutes(status_info["available"])
+                },
+            }]
+        },
+        "Last Updated": {
+            "date": {
+                "start": now.isoformat(),
+            }
+        },
+    }
+
+    notion(
+        "PATCH",
+        f"pages/{current_schedule_page['id']}",
+        json={"properties": properties},
+    )
+
+    print("Schedule Status updated in Notion.")
+    print(f"  Status: {status_info['status_detail']}")
+
+    return status_info
 
 
 # ============================================================
@@ -1365,22 +1534,10 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
 
     # Completed PFS work is immutable history and counts toward the
     # weekly target. The synthetic PFS weekly-hours task does not count.
-    completed_pfs_minutes = 0
-    for allocation in allocations:
-        if not allocation["completed"]:
-            continue
-
-        for master_id in allocation["master_ids"]:
-            task = master_tasks_by_id.get(master_id)
-            if not task or task["task"] == PFS_TASK_NAME:
-                continue
-
-            if task["project"] == PFS_PROJECT_NAME:
-                completed_pfs_minutes += workload_to_minutes(
-                    allocation["allocation"],
-                    task["unit"],
-                )
-                break
+    completed_pfs_minutes = calculate_completed_pfs_minutes(
+        allocations,
+        master_tasks_by_id,
+    )
 
     delete_incomplete_allocations(allocations)
 
@@ -1405,6 +1562,19 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
         )
     else:
         print("PFS weekly target: INACTIVE")
+
+    # Calculate schedule sufficiency BEFORE scheduling consumes block capacity.
+    status_info = calculate_status(
+        tasks,
+        completed,
+        focus_blocks,
+        completed_pfs_minutes,
+    )
+
+    print()
+    print("----------------------------------------")
+    print(status_info["status_detail"])
+    print("----------------------------------------")
 
     new_allocations, remaining = schedule_tasks(
         tasks,
@@ -1432,16 +1602,6 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
 
         create_allocation(allocation)
 
-    status = calculate_status(
-        tasks,
-        remaining,
-        focus_blocks,
-    )
-
-    print()
-    print("----------------------------------------")
-    print(status)
-    print("----------------------------------------")
     print()
 
     return {
@@ -1467,6 +1627,11 @@ def main():
     print(f"Master tasks found: {len(tasks)}")
     print(f"Focus Time blocks found: {len(focus_blocks)}")
     print(f"Task Allocations found: {len(allocations)}")
+
+    # The Schedule Status page is a separate Notion database from the
+    # Daily Plan. Update it every run so the displayed capacity stays
+    # current even when no schedule rebuild is needed.
+    update_schedule_status(tasks, allocations, focus_blocks)
 
     state = load_state()
 
