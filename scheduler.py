@@ -580,31 +580,49 @@ def pfs_minutes_this_week(
 # DEPENDENCIES
 # ============================================================
 
+def normalize_notion_id(value):
+    """Normalize a Notion page ID for reliable comparisons."""
+    if not value:
+        return None
+    return str(value).replace("-", "").strip().lower()
+
+
 def build_dependency_graph(tasks):
+    """Build prerequisite/dependent relationships from Notion."""
     tasks_by_id = {task["page_id"]: task for task in tasks}
+    normalized_ids = {
+        normalize_notion_id(task["page_id"]): task["page_id"]
+        for task in tasks
+    }
     dependents = {task["page_id"]: set() for task in tasks}
 
     for task in tasks:
         valid_dependencies = set()
+
         for dependency_id in task["dependencies"]:
-            if dependency_id == task["page_id"]:
+            matched_id = normalized_ids.get(
+                normalize_notion_id(dependency_id)
+            )
+
+            if normalize_notion_id(dependency_id) == normalize_notion_id(
+                task["page_id"]
+            ):
                 raise RuntimeError(
                     f'Task "{task["task"]}" depends on itself.'
                 )
 
-            if dependency_id not in tasks_by_id:
+            if not matched_id:
                 print(
                     f'Warning: dependency on an unavailable page was '
                     f'ignored for "{task["task"]}".'
                 )
                 continue
 
-            valid_dependencies.add(dependency_id)
-            dependents[dependency_id].add(task["page_id"])
+            valid_dependencies.add(matched_id)
+            dependents[matched_id].add(task["page_id"])
 
         task["dependencies"] = sorted(valid_dependencies)
 
-    # Detect cycles before scheduling.
     visiting = set()
     visited = set()
 
@@ -631,18 +649,6 @@ def build_dependency_graph(tasks):
         visit(task["page_id"], [task["page_id"]])
 
     return tasks_by_id, dependents
-
-
-def subtract_working_days(dt, days):
-    result = dt
-    remaining_days = days
-
-    while remaining_days > 0:
-        result -= timedelta(days=1)
-        if result.weekday() < 5:
-            remaining_days -= 1
-
-    return result
 
 
 def dependency_buffer_for_task(task):
