@@ -985,6 +985,57 @@ def priority_multiplier(priority):
     return 1.00
 
 
+def actual_deadline_end(task):
+    """Return the hard deadline boundary for a Master task.
+
+    Notion date-only deadlines arrive as midnight at the start of the date.
+    For this scheduler, a date-only deadline means the task is due by the
+    end of that calendar day. If Notion supplies an explicit end, preserve
+    that boundary.
+    """
+    deadline = task.get("deadline")
+    if not deadline:
+        return None
+
+    if deadline.get("end"):
+        return deadline["end"]
+
+    start = deadline["start"]
+    return start.replace(
+        hour=23,
+        minute=59,
+        second=59,
+        microsecond=999999,
+    )
+
+
+def deadline_day_kind(task, now):
+    """Return overdue/today/future for the task's actual deadline."""
+    deadline = actual_deadline_end(task)
+    if not deadline:
+        return None
+
+    today = now.date()
+    deadline_date = deadline.date()
+    if deadline_date < today:
+        return "overdue"
+    if deadline_date == today:
+        return "today"
+    return "future"
+
+
+def deadline_forces_continuous(task, now):
+    """High/Medium overdue or due-today work is one whole task.
+
+    Low-priority deadline work deliberately keeps normal chunking so an
+    artificial deadline does not monopolize the schedule.
+    """
+    return (
+        task.get("priority") != "Low"
+        and deadline_day_kind(task, now) in {"overdue", "today"}
+    )
+
+
 def hours_until_effective_deadline(task, now):
     deadline = task.get("effective_deadline")
     if not deadline:
@@ -995,11 +1046,21 @@ def hours_until_effective_deadline(task, now):
 
 def task_score(task, remaining_minutes, now, same_day_minutes, dependency_depth_value):
     hours = hours_until_effective_deadline(task, now)
+    deadline_kind = deadline_day_kind(task, now)
+    is_low = task.get("priority") == "Low"
 
-    if hours is None:
+    if deadline_kind == "overdue" and not is_low:
+        deadline_score = 1000000000
+    elif deadline_kind == "today" and not is_low:
+        deadline_score = 500000000
+    elif hours is None:
         deadline_score = 0.1
-    elif hours <= 0:
+    elif hours <= 0 and not is_low:
         deadline_score = 100000000
+    elif hours <= 0:
+        # Low-priority deadlines are intentionally soft. Once their
+        # deadline passes, they should not leapfrog genuinely urgent work.
+        deadline_score = 0.5
     else:
         deadline_score = 100 / ((hours + 1) ** 2)
 
@@ -1009,8 +1070,6 @@ def task_score(task, remaining_minutes, now, same_day_minutes, dependency_depth_
         + min(2.0, remaining_minutes / 120)
     )
 
-    # Dependencies create additional urgency, but the main driver is
-    # still the effective deadline calculated from downstream work.
     if dependency_depth_value > 0:
         score *= 1.0 + min(0.20, 0.05 * dependency_depth_value)
 
@@ -1036,35 +1095,35 @@ def task_is_eligible(
     if task["completed"]:
         return False
 
-    # A dependent task cannot begin until all prerequisites are done.
     if dependency_blocked(task, tasks_by_id, completed, remaining):
         return False
 
+    actual_deadline = actual_deadline_end(task)
+    deadline_kind = deadline_day_kind(task, now)
     effective_deadline = task.get("effective_deadline")
 
-    # No actual or inherited deadline: eligible normally.
+    # Overdue and due-today High/Medium work is intentionally allowed to
+    # behave as a whole task. Low-priority deadline work remains normal.
+    if deadline_kind in {"overdue", "today"} and task.get("priority") != "Low":
+        if deadline_kind == "today":
+            return block_start.date() == now.date()
+        # An overdue task's actual deadline has already passed, so every
+        # remaining future Focus Time block is a recovery opportunity.
+        return True
+
     if not effective_deadline:
         return True
 
-    # Preserve the deadline-day rule for the task's actual deadline. This
-    # check must happen before the effective-deadline urgency check because
-    # the normal planning target is intentionally one day earlier. On the
-    # actual deadline day, only a final 15-minute-or-less fragment may be
-    # scheduled.
-    actual_deadline = task["deadline"]["start"] if task["deadline"] else None
-    if actual_deadline and actual_deadline.date() == now.date():
-        return remaining_minutes <= MIN_CHUNK_MINUTES
-
-    # If the effective deadline has passed, the task becomes urgent.
+    # A task whose planning deadline has passed becomes urgent, but its
+    # actual deadline remains the hard boundary.
     if effective_deadline <= now:
+        if actual_deadline and block_start >= actual_deadline:
+            return False
         return True
 
-    # Never schedule work into or beyond the effective planning
-    # deadline unless that deadline has already become urgent.
     if block_start >= effective_deadline:
         return False
 
-    # Also preserve the actual hard deadline.
     if actual_deadline and block_start >= actual_deadline:
         return False
 
@@ -1081,13 +1140,13 @@ def choose_allocation_size(
 ):
     maximum = min(remaining_minutes, available_minutes)
 
-    # Hard barrier for both the task's own deadline and its
-    # dependency-derived planning deadline.
     barriers = []
     if task.get("effective_deadline") and task["effective_deadline"] > now:
         barriers.append(task["effective_deadline"])
-    if task["deadline"] and task["deadline"]["start"] > now:
-        barriers.append(task["deadline"]["start"])
+
+    actual_deadline = actual_deadline_end(task)
+    if actual_deadline and actual_deadline > now:
+        barriers.append(actual_deadline)
 
     if barriers:
         earliest_barrier = min(barriers)
@@ -1099,7 +1158,11 @@ def choose_allocation_size(
     if maximum <= 0:
         return 0
 
-    if task["continuous"]:
+    # High/Medium overdue or due-today tasks are deliberately represented as
+    # one whole task. If the whole task cannot fit in this single Focus Time
+    # block, leave it unscheduled rather than splitting it.
+    forced_continuous = deadline_forces_continuous(task, now)
+    if task["continuous"] or forced_continuous:
         if remaining_minutes <= maximum:
             return remaining_minutes
         return 0
@@ -1292,6 +1355,7 @@ def schedule_tasks(
                     "task": chosen,
                     "amount_minutes": amount,
                     "focus_page_id": block["page_id"],
+                    "focus_page_start": block["start"],
                 })
 
                 block["remaining"] -= amount
@@ -1318,12 +1382,48 @@ def schedule_tasks(
                 "task": chosen,
                 "amount_minutes": amount,
                 "focus_page_id": block["page_id"],
+                "focus_page_start": block["start"],
             })
 
             block["remaining"] -= amount
             remaining[chosen["page_id"]] -= amount
 
     return new_allocations, remaining
+
+
+def assign_schedule_order(new_allocations, now):
+    """Assign a stable top-down order to the newly created allocations."""
+    def urgency_key(item):
+        task = item["task"]
+        kind = deadline_day_kind(task, now)
+        priority_rank = {"High": 0, "Medium": 1, "Low": 3}.get(
+            task.get("priority"), 2
+        )
+
+        if kind == "overdue" and task.get("priority") != "Low":
+            tier = 0
+        elif kind == "today" and task.get("priority") != "Low":
+            tier = 1
+        elif kind == "overdue":
+            tier = 4
+        elif kind == "today":
+            tier = 5
+        else:
+            tier = 2
+
+        effective = task.get("effective_deadline")
+        effective_key = effective.timestamp() if effective else float("inf")
+        block_key = item.get("focus_page_start", datetime.max.replace(tzinfo=TZ)).timestamp()
+        return (tier, priority_rank, effective_key, block_key, task["task"].lower())
+
+    for order, allocation in enumerate(
+        sorted(new_allocations, key=urgency_key),
+        start=1,
+    ):
+        allocation["schedule_order"] = order
+        allocation["overdue"] = deadline_day_kind(
+            allocation["task"], now
+        ) == "overdue"
 
 
 # ============================================================
@@ -1349,6 +1449,12 @@ def create_allocation(allocation):
             "title": [{
                 "text": {"content": name}
             }]
+        },
+        "Schedule Order": {
+            "number": allocation.get("schedule_order", 0)
+        },
+        "Overdue": {
+            "checkbox": allocation.get("overdue", False)
         },
         "Focus time": {
             "relation": [{
@@ -1394,14 +1500,15 @@ def create_allocation(allocation):
 # ============================================================
 
 def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
-    """Assess whether current Focus Time can meet actual deadlines.
+    """Assess hard-deadline feasibility against currently loaded Focus Time.
 
-    Earlier planning targets remain scheduling preferences. Schedule Status
-    treats the actual Deadline as the hard feasibility boundary. Deadlines
-    beyond the current rolling Focus Time horizon are not declared infeasible
-    merely because those future blocks have not been created yet.
+    Date-only Notion deadlines mean "by the end of that date." High and
+    Medium priority deadlines are hard for status purposes; Low priority
+    deadlines are treated as soft so artificial dates do not create a false
+    red status. Planning targets remain scheduling preferences.
     """
     now = datetime.now(TZ)
+    horizon = now + timedelta(days=PLANNING_DAYS)
     available = sum(block["remaining"] for block in focus_blocks)
     total_remaining = 0
 
@@ -1414,44 +1521,110 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
             remaining[task["page_id"]] = rem
             total_remaining += rem
 
+    tasks_by_id, dependents = build_dependency_graph(tasks)
+
+    # Only hard-deadline tasks seed the feasibility calculation. A prerequisite
+    # of a hard-deadline task inherits the downstream requirement even if the
+    # prerequisite itself has no deadline. Low-priority deadline work remains
+    # schedulable, but cannot by itself make the status red.
+    required_by = {}
+    for task in tasks:
+        if task["completed"] or task["task"] == PFS_TASK_NAME:
+            continue
+        if task.get("priority") == "Low":
+            continue
+        deadline = actual_deadline_end(task)
+        if deadline is not None:
+            required_by[task["page_id"]] = deadline
+
+    visiting = set()
+
+    def solve_required_by(task_id):
+        if task_id in visiting:
+            raise RuntimeError(
+                "Circular dependency detected while calculating status deadlines."
+            )
+        visiting.add(task_id)
+
+        for dependent_id in dependents.get(task_id, []):
+            solve_required_by(dependent_id)
+            dependent = tasks_by_id[dependent_id]
+            dependent_remaining = remaining.get(dependent_id, 0)
+            if dependent["completed"] or dependent_remaining <= 0:
+                continue
+
+            downstream = required_by.get(dependent_id)
+            if downstream is None:
+                continue
+
+            candidate = (
+                downstream
+                - timedelta(minutes=dependent_remaining)
+                - dependency_buffer_for_task(dependent)
+            )
+            own = required_by.get(task_id)
+            if own is None or candidate < own:
+                required_by[task_id] = candidate
+
+        visiting.remove(task_id)
+
+    for task in tasks:
+        solve_required_by(task["page_id"])
+
     deadline_tasks = []
     for task in tasks:
         if task["completed"] or task["task"] == PFS_TASK_NAME:
             continue
         rem = remaining.get(task["page_id"], 0)
-        deadline = task.get("deadline")
-        if rem <= 0 or not deadline:
+        required_deadline = required_by.get(task["page_id"])
+        if rem <= 0 or required_deadline is None:
             continue
-        deadline_tasks.append((deadline["start"], rem, task))
+        deadline_tasks.append((required_deadline, rem, task))
 
     deadline_tasks.sort(key=lambda item: item[0])
+    assessed = [
+        item for item in deadline_tasks
+        if item[0] <= horizon
+    ]
 
-    horizon = now + timedelta(days=PLANNING_DAYS)
-    deadline_required = 0
-    deficit = 0
+    cumulative_required = 0
+    worst_shortfall = 0
+    worst_slack = None
     first_deficit_deadline = None
+    first_deficit_tasks = []
 
-    for deadline, rem, task in deadline_tasks:
-        if deadline > horizon:
-            continue
+    for deadline, rem, task in assessed:
+        cumulative_required += rem
 
-        deadline_required += rem
-        capacity_through_deadline = sum(
-            block["remaining"]
-            for block in focus_blocks
-            if block["start"] < deadline
-        )
+        capacity_through_deadline = 0
+        for block in focus_blocks:
+            if block["start"] >= deadline:
+                continue
 
-        shortfall = deadline_required - capacity_through_deadline
-        if shortfall > deficit:
-            deficit = shortfall
+            usable_end = min(block["end"], deadline)
+            block_minutes = max(
+                0,
+                int((usable_end - block["start"]).total_seconds() / 60),
+            )
+            capacity_through_deadline += min(
+                block["remaining"],
+                block_minutes,
+            )
+
+        slack = capacity_through_deadline - cumulative_required
+        if worst_slack is None or slack < worst_slack:
+            worst_slack = slack
+
+        if slack < 0 and abs(slack) > worst_shortfall:
+            worst_shortfall = abs(slack)
             first_deficit_deadline = deadline
+            first_deficit_tasks = [
+                candidate_task["task"]
+                for candidate_deadline, _, candidate_task in assessed
+                if candidate_deadline <= deadline
+            ]
 
-    near_term_deadline_work = sum(
-        rem
-        for deadline, rem, _ in deadline_tasks
-        if deadline <= horizon
-    )
+    near_term_deadline_work = sum(rem for _, rem, _ in assessed)
 
     pfs_required = 0
     pfs_task_active = any(
@@ -1464,26 +1637,37 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
             PFS_WEEKLY_TARGET_MINUTES - completed_pfs_minutes,
         )
 
-    if deficit > 0:
+    if worst_shortfall > 0:
         status = "🟠 Needs attention"
         status_detail = (
             "🟠 Needs attention — "
-            f"{format_minutes(deficit)} additional Focus Time needed "
-            "to meet an actual deadline"
+            f"{format_minutes(worst_shortfall)} additional Focus Time needed "
+            "to meet an actual High/Medium-priority deadline"
         )
-        difference = -deficit
+        difference = -worst_shortfall
     else:
         status = "🟢 On track"
-        status_detail = (
-            "🟢 On track — all actual deadlines currently within the "
-            "planning horizon are feasible with available Focus Time"
-        )
-        difference = available - near_term_deadline_work
+        if worst_slack is None:
+            difference = available
+            status_detail = (
+                "🟢 On track — no hard actual deadlines currently require "
+                "additional Focus Time"
+            )
+        else:
+            difference = worst_slack
+            status_detail = (
+                "🟢 On track — minimum hard-deadline slack is "
+                f"{format_minutes(worst_slack)}"
+            )
 
     if first_deficit_deadline:
         print(
             "First capacity shortfall at actual deadline: "
             f"{first_deficit_deadline.isoformat()}"
+        )
+        print(
+            "  Deadline-feasibility tasks: "
+            + ", ".join(first_deficit_tasks)
         )
 
     print(
@@ -1908,6 +2092,8 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
         pfs_task,
         completed_pfs_minutes,
     )
+
+    assign_schedule_order(new_allocations, datetime.now(TZ))
 
     print(
         f"New allocations to create: {len(new_allocations)}"
