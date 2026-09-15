@@ -250,7 +250,13 @@ def query_data_source(data_source_id):
 
 
 def archive_page(page_id):
-    notion("PATCH", f"pages/{page_id}", json={"archived": True})
+    """Move a provisional Task Allocation to Notion trash.
+
+    The current Notion API no longer accepts the legacy ``archived`` page
+    property for this operation. ``in_trash`` is the supported replacement.
+    This function is used only for incomplete/provisional allocations.
+    """
+    notion("PATCH", f"pages/{page_id}", json={"in_trash": True})
 
 
 # ============================================================
@@ -482,6 +488,7 @@ def read_allocations():
             "focus_ids": relation_ids(page, "Focus time"),
             "master_ids": relation_ids(page, "Master To-Do List"),
             "allocation": number_value(page, "Allocation") or 0,
+            "unit": select_value(page, "Unit"),
             "completed": checkbox_value(page, "Completion"),
         })
 
@@ -491,6 +498,63 @@ def read_allocations():
 # ============================================================
 # ALLOCATION ACCOUNTING
 # ============================================================
+
+def matched_master_id_for_allocation(allocation, master_tasks_by_id):
+    """Return the single Master task an allocation should credit.
+
+    Task Allocations are intended to represent work on one Master task.
+    If an old or malformed record contains multiple Master relations, the
+    allocation amount must not be counted multiple times. We therefore use
+    the first valid linked Master task and warn so the data issue is visible.
+    """
+    normalized_master_ids = {
+        normalize_notion_id(master_id): master_id
+        for master_id in master_tasks_by_id
+    }
+
+    matched_ids = []
+    for raw_master_id in allocation["master_ids"]:
+        master_id = normalized_master_ids.get(
+            normalize_notion_id(raw_master_id)
+        )
+        if not master_id:
+            print(
+                "Warning: allocation "
+                f'"{allocation["name"]}" points to a Master task '
+                f'ID that was not found: {raw_master_id}'
+            )
+            continue
+        matched_ids.append(master_id)
+
+    if not matched_ids:
+        return None
+
+    if len(matched_ids) > 1:
+        task_names = [
+            master_tasks_by_id[master_id]["task"]
+            for master_id in matched_ids
+        ]
+        print(
+            "Warning: allocation "
+            f'"{allocation["name"]}" is related to multiple Master tasks '
+            f"({', '.join(task_names)}). The allocation will be credited "
+            "once, to the first valid relation, rather than double-counted."
+        )
+
+    return matched_ids[0]
+
+
+def allocation_minutes_for_task(allocation, task):
+    """Convert an allocation's stored amount using its own Unit.
+
+    The Task Allocation database has its own Unit property. Using that
+    property prevents historical allocations from being misread if a
+    Master task's Unit is later changed. Older records without Unit fall
+    back to the Master task's Unit.
+    """
+    unit = allocation.get("unit") or task["unit"]
+    return workload_to_minutes(allocation["allocation"], unit)
+
 
 def calculate_completed_work(allocations, master_tasks_by_id):
     """
@@ -506,36 +570,20 @@ def calculate_completed_work(allocations, master_tasks_by_id):
     """
     completed = {}
 
-    normalized_master_ids = {
-        normalize_notion_id(master_id): master_id
-        for master_id in master_tasks_by_id
-    }
-
     for allocation in allocations:
         if not allocation["completed"]:
             continue
 
-        # A normal Task Allocation points to one Master task. If a relation
-        # ever contains more than one Master task, credit the allocation
-        # separately to each linked task using that task's own unit.
-        for raw_master_id in allocation["master_ids"]:
-            master_id = normalized_master_ids.get(
-                normalize_notion_id(raw_master_id)
-            )
-            if not master_id:
-                print(
-                    "Warning: completed allocation "
-                    f'"{allocation["name"]}" points to a Master task '
-                    f'ID that was not found: {raw_master_id}'
-                )
-                continue
+        master_id = matched_master_id_for_allocation(
+            allocation,
+            master_tasks_by_id,
+        )
+        if not master_id:
+            continue
 
-            task = master_tasks_by_id[master_id]
-            minutes = workload_to_minutes(
-                allocation["allocation"],
-                task["unit"],
-            )
-            completed[master_id] = completed.get(master_id, 0) + minutes
+        task = master_tasks_by_id[master_id]
+        minutes = allocation_minutes_for_task(allocation, task)
+        completed[master_id] = completed.get(master_id, 0) + minutes
 
     if completed:
         print("Completed Task Allocation time credited to Master tasks:")
@@ -1414,36 +1462,51 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
     }
 
 
-def calculate_completed_pfs_minutes(allocations, master_tasks_by_id):
+def calculate_completed_pfs_minutes(
+    allocations,
+    master_tasks_by_id,
+    all_focus_blocks,
+):
     """Return completed PFS project time for the current week."""
     completed_pfs_minutes = 0
-
-    normalized_master_ids = {
-        normalize_notion_id(master_id): master_id
-        for master_id in master_tasks_by_id
+    week_start, week_end = current_week_range()
+    blocks_by_id = {
+        block["page_id"]: block
+        for block in all_focus_blocks
     }
 
     for allocation in allocations:
         if not allocation["completed"]:
             continue
 
-        for raw_master_id in allocation["master_ids"]:
-            master_id = normalized_master_ids.get(
-                normalize_notion_id(raw_master_id)
+        master_id = matched_master_id_for_allocation(
+            allocation,
+            master_tasks_by_id,
+        )
+        if not master_id:
+            continue
+
+        task = master_tasks_by_id[master_id]
+        if task["task"] == PFS_TASK_NAME:
+            continue
+
+        if task["project"] == PFS_PROJECT_NAME:
+            # Completed PFS time counts toward the current Monday–Sunday
+            # target only when the completed allocation is attached to a
+            # Focus Time block in the current week.
+            in_current_week = any(
+                focus_id in blocks_by_id
+                and week_start
+                <= blocks_by_id[focus_id]["start"].date()
+                < week_end
+                for focus_id in allocation["focus_ids"]
             )
-            if not master_id:
-                continue
 
-            task = master_tasks_by_id[master_id]
-            if task["task"] == PFS_TASK_NAME:
-                continue
-
-            if task["project"] == PFS_PROJECT_NAME:
-                completed_pfs_minutes += workload_to_minutes(
-                    allocation["allocation"],
-                    task["unit"],
+            if in_current_week:
+                completed_pfs_minutes += allocation_minutes_for_task(
+                    allocation,
+                    task,
                 )
-                break
 
     return completed_pfs_minutes
 
@@ -1462,6 +1525,7 @@ def update_schedule_status(tasks, allocations, focus_blocks):
     completed_pfs_minutes = calculate_completed_pfs_minutes(
         allocations,
         master_tasks_by_id,
+        all_focus_blocks,
     )
 
     status_info = calculate_status(
@@ -1679,6 +1743,7 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
     completed_pfs_minutes = calculate_completed_pfs_minutes(
         allocations,
         master_tasks_by_id,
+        all_focus_blocks,
     )
 
     delete_incomplete_allocations(allocations)
