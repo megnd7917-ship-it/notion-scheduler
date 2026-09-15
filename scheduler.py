@@ -389,7 +389,6 @@ def read_master_tasks():
             "priority": select_value(page, "Priority level"),
             "continuous": checkbox_value(page, "Continuous"),
             "completed": checkbox_value(page, "Completed"),
-            "overdue": checkbox_value(page, "Overdue"),
             "minutes": workload_to_minutes(workload, unit),
             "dependencies": relation_ids(
                 page,
@@ -491,6 +490,7 @@ def read_allocations():
             "allocation": number_value(page, "Allocation") or 0,
             "unit": select_value(page, "Unit"),
             "completed": checkbox_value(page, "Completion"),
+            "overdue": checkbox_value(page, "Overdue"),
         })
 
     return allocations
@@ -1562,34 +1562,55 @@ def calculate_completed_pfs_minutes(
 
 
 
-def update_overdue_flags(tasks, completed):
-    """Synchronize the Master To-Do List Overdue checkbox.
+def update_overdue_flags(tasks, allocations, completed):
+    """Synchronize the Overdue checkbox on Task Allocation pages.
 
-    A task is overdue only when its actual deadline date has passed and it
-    still has outstanding work. The earlier planning target is ignored.
+    Overdue is a display aid in the Task Allocations database. An incomplete
+    allocation is marked overdue when its linked Master task has an actual
+    deadline before today and still has outstanding work. The day-before
+    planning target is intentionally ignored.
     """
     today = datetime.now(TZ).date()
+    master_tasks_by_id = {
+        task["page_id"]: task
+        for task in tasks
+    }
+
+    overdue_master_ids = set()
+    for task in tasks:
+        if task["completed"] or task["task"] == PFS_TASK_NAME:
+            continue
+
+        rem = max(0, task["minutes"] - completed.get(task["page_id"], 0))
+        deadline = task.get("deadline")
+        if (
+            rem > 0
+            and deadline is not None
+            and deadline["start"].date() < today
+        ):
+            overdue_master_ids.add(task["page_id"])
+
     changed = 0
 
-    for task in tasks:
-        if task["task"] == PFS_TASK_NAME:
-            should_be_overdue = False
-        else:
-            rem = max(0, task["minutes"] - completed.get(task["page_id"], 0))
-            deadline = task.get("deadline")
-            should_be_overdue = (
-                rem > 0
-                and not task["completed"]
-                and deadline is not None
-                and deadline["start"].date() < today
-            )
+    for allocation in allocations:
+        # Completed allocations are historical records. They should not be
+        # relabeled as overdue after the work has been completed.
+        master_id = matched_master_id_for_allocation(
+            allocation,
+            master_tasks_by_id,
+        )
+        should_be_overdue = (
+            not allocation["completed"]
+            and master_id in overdue_master_ids
+        )
 
-        if task.get("overdue", False) == should_be_overdue:
+        current_overdue = allocation.get("overdue", False)
+        if current_overdue == should_be_overdue:
             continue
 
         notion(
             "PATCH",
-            f"pages/{task['page_id']}",
+            f"pages/{allocation['page_id']}",
             json={
                 "properties": {
                     "Overdue": {
@@ -1598,11 +1619,11 @@ def update_overdue_flags(tasks, completed):
                 }
             },
         )
-        task["overdue"] = should_be_overdue
+        allocation["overdue"] = should_be_overdue
         changed += 1
 
     if changed:
-        print(f"Updated Overdue status on {changed} Master To-Do task(s).")
+        print(f"Updated Overdue status on {changed} Task Allocation(s).")
     else:
         print("Overdue statuses are already up to date.")
 
@@ -1623,7 +1644,7 @@ def update_schedule_status(tasks, allocations, all_focus_blocks, focus_blocks):
         all_focus_blocks,
     )
 
-    update_overdue_flags(tasks, completed)
+    update_overdue_flags(tasks, allocations, completed)
 
     status_info = calculate_status(
         tasks,
