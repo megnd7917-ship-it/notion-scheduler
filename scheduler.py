@@ -1432,12 +1432,19 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
 
     deadline_tasks.sort(key=lambda item: item[0])
 
+    horizon = now + timedelta(days=PLANNING_DAYS)
     deadline_required = 0
-    deadline_capacity_used = 0
     deficit = 0
     first_deficit_deadline = None
 
     for deadline, rem, task in deadline_tasks:
+        # Do not declare a future deadline infeasible merely because the
+        # current 14-day Focus Time horizon does not extend to it. The
+        # horizon rolls forward on subsequent scheduler runs. Overdue and
+        # in-horizon planning deadlines are still assessed normally.
+        if deadline > horizon:
+            continue
+
         deadline_required += rem
         capacity_through_deadline = sum(
             block["remaining"]
@@ -1457,7 +1464,6 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
     # planning deadline inside the 14-day scheduling horizon, not every
     # task whose actual deadline happens to fall inside an arbitrary 18-day
     # window.
-    horizon = now + timedelta(days=PLANNING_DAYS)
     near_term_tasks = [
         (deadline, rem)
         for deadline, rem, _ in deadline_tasks
