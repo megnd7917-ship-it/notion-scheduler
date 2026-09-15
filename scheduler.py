@@ -389,6 +389,7 @@ def read_master_tasks():
             "priority": select_value(page, "Priority level"),
             "continuous": checkbox_value(page, "Continuous"),
             "completed": checkbox_value(page, "Completed"),
+            "overdue": checkbox_value(page, "Overdue"),
             "minutes": workload_to_minutes(workload, unit),
             "dependencies": relation_ids(
                 page,
@@ -1393,15 +1394,14 @@ def create_allocation(allocation):
 # ============================================================
 
 def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
-    """Assess whether current Focus Time can meet real deadlines.
+    """Assess whether current Focus Time can meet actual deadlines.
 
-    Early starts are a scheduling preference, not a reason to report a
-    deficit. A deficit is reported only when the remaining work cannot be
-    completed by its planning deadline (normally one day before the actual
-    deadline), using the Focus Time that occurs before that point.
+    Earlier planning targets remain scheduling preferences. Schedule Status
+    treats the actual Deadline as the hard feasibility boundary. Deadlines
+    beyond the current rolling Focus Time horizon are not declared infeasible
+    merely because those future blocks have not been created yet.
     """
     now = datetime.now(TZ)
-
     available = sum(block["remaining"] for block in focus_blocks)
     total_remaining = 0
 
@@ -1414,21 +1414,15 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
             remaining[task["page_id"]] = rem
             total_remaining += rem
 
-    # Use the same dependency-aware planning deadlines as the scheduler.
-    calculate_dependency_deadlines(tasks, remaining)
-
-    # Capacity is evaluated cumulatively at each planning deadline. This is
-    # the important distinction from the old 18-day total: later work does
-    # not consume capacity that is needed for an earlier deadline.
     deadline_tasks = []
     for task in tasks:
         if task["completed"] or task["task"] == PFS_TASK_NAME:
             continue
         rem = remaining.get(task["page_id"], 0)
-        deadline = task.get("effective_deadline")
+        deadline = task.get("deadline")
         if rem <= 0 or not deadline:
             continue
-        deadline_tasks.append((deadline, rem, task))
+        deadline_tasks.append((deadline["start"], rem, task))
 
     deadline_tasks.sort(key=lambda item: item[0])
 
@@ -1438,10 +1432,6 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
     first_deficit_deadline = None
 
     for deadline, rem, task in deadline_tasks:
-        # Do not declare a future deadline infeasible merely because the
-        # current 14-day Focus Time horizon does not extend to it. The
-        # horizon rolls forward on subsequent scheduler runs. Overdue and
-        # in-horizon planning deadlines are still assessed normally.
         if deadline > horizon:
             continue
 
@@ -1452,27 +1442,17 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
             if block["start"] < deadline
         )
 
-        # Each task's remaining workload is cumulative pressure. The
-        # largest shortfall encountered at any deadline is the true
-        # schedule deficit.
         shortfall = deadline_required - capacity_through_deadline
         if shortfall > deficit:
             deficit = shortfall
             first_deficit_deadline = deadline
 
-    # Keep the displayed near-term figure useful: it is work with a
-    # planning deadline inside the 14-day scheduling horizon, not every
-    # task whose actual deadline happens to fall inside an arbitrary 18-day
-    # window.
-    near_term_tasks = [
-        (deadline, rem)
+    near_term_deadline_work = sum(
+        rem
         for deadline, rem, _ in deadline_tasks
         if deadline <= horizon
-    ]
-    near_term_deadline_work = sum(rem for _, rem in near_term_tasks)
+    )
 
-    # PFS is a weekly target rather than a hard deadline. It should not
-    # independently turn the schedule red when deadline work is feasible.
     pfs_required = 0
     pfs_task_active = any(
         task["task"] == PFS_TASK_NAME and not task["completed"]
@@ -1489,20 +1469,20 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
         status_detail = (
             "🟠 Needs attention — "
             f"{format_minutes(deficit)} additional Focus Time needed "
-            "to meet a planning deadline"
+            "to meet an actual deadline"
         )
         difference = -deficit
     else:
         status = "🟢 On track"
         status_detail = (
-            "🟢 On track — all currently assessable deadlines are feasible "
-            "with the available Focus Time"
+            "🟢 On track — all actual deadlines currently within the "
+            "planning horizon are feasible with available Focus Time"
         )
         difference = available - near_term_deadline_work
 
     if first_deficit_deadline:
         print(
-            "First capacity shortfall at planning deadline: "
+            "First capacity shortfall at actual deadline: "
             f"{first_deficit_deadline.isoformat()}"
         )
 
@@ -1581,6 +1561,51 @@ def calculate_completed_pfs_minutes(
     return completed_pfs_minutes
 
 
+
+def update_overdue_flags(tasks, completed):
+    """Synchronize the Master To-Do List Overdue checkbox.
+
+    A task is overdue only when its actual deadline date has passed and it
+    still has outstanding work. The earlier planning target is ignored.
+    """
+    today = datetime.now(TZ).date()
+    changed = 0
+
+    for task in tasks:
+        if task["task"] == PFS_TASK_NAME:
+            should_be_overdue = False
+        else:
+            rem = max(0, task["minutes"] - completed.get(task["page_id"], 0))
+            deadline = task.get("deadline")
+            should_be_overdue = (
+                rem > 0
+                and not task["completed"]
+                and deadline is not None
+                and deadline["start"].date() < today
+            )
+
+        if task.get("overdue", False) == should_be_overdue:
+            continue
+
+        notion(
+            "PATCH",
+            f"pages/{task['page_id']}",
+            json={
+                "properties": {
+                    "Overdue": {
+                        "checkbox": should_be_overdue,
+                    }
+                }
+            },
+        )
+        task["overdue"] = should_be_overdue
+        changed += 1
+
+    if changed:
+        print(f"Updated Overdue status on {changed} Master To-Do task(s).")
+    else:
+        print("Overdue statuses are already up to date.")
+
 def update_schedule_status(tasks, allocations, all_focus_blocks, focus_blocks):
     """Update the single Current Schedule page and read its controls."""
     master_tasks_by_id = {
@@ -1597,6 +1622,8 @@ def update_schedule_status(tasks, allocations, all_focus_blocks, focus_blocks):
         master_tasks_by_id,
         all_focus_blocks,
     )
+
+    update_overdue_flags(tasks, completed)
 
     status_info = calculate_status(
         tasks,
