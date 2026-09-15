@@ -1511,7 +1511,7 @@ def calculate_completed_pfs_minutes(
     return completed_pfs_minutes
 
 
-def update_schedule_status(tasks, allocations, focus_blocks):
+def update_schedule_status(tasks, allocations, all_focus_blocks, focus_blocks):
     """Update the single Current Schedule page and read its controls."""
     master_tasks_by_id = {
         task["page_id"]: task
@@ -1842,6 +1842,7 @@ def main():
     schedule_status = update_schedule_status(
         tasks,
         allocations,
+        all_focus_blocks,
         focus_blocks,
     )
     reconsider_requested = schedule_status["reconsider_requested"]
