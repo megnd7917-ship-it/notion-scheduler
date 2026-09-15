@@ -740,27 +740,34 @@ def dependency_buffer_for_task(task):
     )
 
 
+def task_planning_deadline(task):
+    """Return the normal target for finishing a task.
+
+    A task with a real deadline should normally be finished one calendar
+    day before that deadline. The actual deadline remains a hard backstop
+    elsewhere in the scheduler, where at most one 15-minute fragment may
+    be scheduled on deadline day.
+    """
+    if not task["deadline"]:
+        return None
+    return task["deadline"]["start"] - timedelta(days=1)
+
+
 def calculate_dependency_deadlines(tasks, remaining):
     """
     Work backward through dependency chains.
 
-    For a prerequisite A -> B, B's effective deadline becomes the
-    latest point at which B can still be comfortably completed. A's
-    effective deadline is then:
+    Standalone tasks normally target completion one day before their actual
+    deadline. For a prerequisite A -> B, A must also leave one full working
+    day of breathing room before B's remaining work has to begin.
 
-        B effective deadline
-        - B remaining workload
-        - one full working day of buffer
-
-    The earliest constraint wins when a task has both its own deadline
-    and a downstream dependency deadline.
+    The earliest constraint wins when a task has both its own planning target
+    and a downstream dependency target.
     """
     tasks_by_id, dependents = build_dependency_graph(tasks)
 
     effective = {
-        task_id: task["deadline"]["start"]
-        if task["deadline"]
-        else None
+        task_id: task_planning_deadline(task)
         for task_id, task in tasks_by_id.items()
     }
 
@@ -1038,17 +1045,18 @@ def task_is_eligible(
     if not effective_deadline:
         return True
 
+    # Preserve the deadline-day rule for the task's actual deadline. This
+    # check must happen before the effective-deadline urgency check because
+    # the normal planning target is intentionally one day earlier. On the
+    # actual deadline day, only a final 15-minute-or-less fragment may be
+    # scheduled.
+    actual_deadline = task["deadline"]["start"] if task["deadline"] else None
+    if actual_deadline and actual_deadline.date() == now.date():
+        return remaining_minutes <= MIN_CHUNK_MINUTES
+
     # If the effective deadline has passed, the task becomes urgent.
     if effective_deadline <= now:
         return True
-
-    # Preserve the existing deadline-day rule for the task's actual
-    # deadline. Dependency-derived deadlines are planning targets, so
-    # they remain schedulable right up to their barrier.
-    actual_deadline = task["deadline"]["start"] if task["deadline"] else None
-    if actual_deadline and actual_deadline.date() == now.date():
-        if remaining_minutes > MIN_CHUNK_MINUTES:
-            return False
 
     # Never schedule work into or beyond the effective planning
     # deadline unless that deadline has already become urgent.
@@ -1385,29 +1393,80 @@ def create_allocation(allocation):
 # ============================================================
 
 def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
-    """Calculate schedule sufficiency before scheduling consumes capacity."""
+    """Assess whether current Focus Time can meet real deadlines.
+
+    Early starts are a scheduling preference, not a reason to report a
+    deficit. A deficit is reported only when the remaining work cannot be
+    completed by its planning deadline (normally one day before the actual
+    deadline), using the Focus Time that occurs before that point.
+    """
     now = datetime.now(TZ)
 
     available = sum(block["remaining"] for block in focus_blocks)
-
-    deadline_required = 0
     total_remaining = 0
 
+    remaining = {}
     for task in tasks:
         if task["completed"] or task["task"] == PFS_TASK_NAME:
             continue
-
         rem = max(0, task["minutes"] - completed.get(task["page_id"], 0))
-        if rem <= 0:
+        if rem > 0:
+            remaining[task["page_id"]] = rem
+            total_remaining += rem
+
+    # Use the same dependency-aware planning deadlines as the scheduler.
+    calculate_dependency_deadlines(tasks, remaining)
+
+    # Capacity is evaluated cumulatively at each planning deadline. This is
+    # the important distinction from the old 18-day total: later work does
+    # not consume capacity that is needed for an earlier deadline.
+    deadline_tasks = []
+    for task in tasks:
+        if task["completed"] or task["task"] == PFS_TASK_NAME:
             continue
+        rem = remaining.get(task["page_id"], 0)
+        deadline = task.get("effective_deadline")
+        if rem <= 0 or not deadline:
+            continue
+        deadline_tasks.append((deadline, rem, task))
 
-        total_remaining += rem
+    deadline_tasks.sort(key=lambda item: item[0])
 
-        if task["deadline"]:
-            deadline = task["deadline"]["start"]
-            if deadline <= now + timedelta(days=18):
-                deadline_required += rem
+    deadline_required = 0
+    deadline_capacity_used = 0
+    deficit = 0
+    first_deficit_deadline = None
 
+    for deadline, rem, task in deadline_tasks:
+        deadline_required += rem
+        capacity_through_deadline = sum(
+            block["remaining"]
+            for block in focus_blocks
+            if block["start"] < deadline
+        )
+
+        # Each task's remaining workload is cumulative pressure. The
+        # largest shortfall encountered at any deadline is the true
+        # schedule deficit.
+        shortfall = deadline_required - capacity_through_deadline
+        if shortfall > deficit:
+            deficit = shortfall
+            first_deficit_deadline = deadline
+
+    # Keep the displayed near-term figure useful: it is work with a
+    # planning deadline inside the 14-day scheduling horizon, not every
+    # task whose actual deadline happens to fall inside an arbitrary 18-day
+    # window.
+    horizon = now + timedelta(days=PLANNING_DAYS)
+    near_term_tasks = [
+        (deadline, rem)
+        for deadline, rem, _ in deadline_tasks
+        if deadline <= horizon
+    ]
+    near_term_deadline_work = sum(rem for _, rem in near_term_tasks)
+
+    # PFS is a weekly target rather than a hard deadline. It should not
+    # independently turn the schedule red when deadline work is feasible.
     pfs_required = 0
     pfs_task_active = any(
         task["task"] == PFS_TASK_NAME and not task["completed"]
@@ -1419,28 +1478,33 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
             PFS_WEEKLY_TARGET_MINUTES - completed_pfs_minutes,
         )
 
-    required = deadline_required + pfs_required
-    difference = available - required
-
-    if difference >= 0:
-        status = "🟢 On track"
-        status_detail = (
-            "🟢 On track — enough time available "
-            f"({format_minutes(difference)} surplus)"
-        )
-    else:
+    if deficit > 0:
         status = "🟠 Needs attention"
         status_detail = (
             "🟠 Needs attention — "
-            f"{format_minutes(abs(difference))} "
-            "additional Focus Time needed"
+            f"{format_minutes(deficit)} additional Focus Time needed "
+            "to meet a planning deadline"
+        )
+        difference = -deficit
+    else:
+        status = "🟢 On track"
+        status_detail = (
+            "🟢 On track — all currently assessable deadlines are feasible "
+            "with the available Focus Time"
+        )
+        difference = available - near_term_deadline_work
+
+    if first_deficit_deadline:
+        print(
+            "First capacity shortfall at planning deadline: "
+            f"{first_deficit_deadline.isoformat()}"
         )
 
     print(
         f"Schedule capacity: {format_minutes(available)} Focus Time available"
     )
     print(
-        f"Near-term deadline work: {format_minutes(deadline_required)} required"
+        f"Near-term deadline work: {format_minutes(near_term_deadline_work)} required"
     )
     if pfs_task_active:
         print(
@@ -1454,7 +1518,7 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
         "status": status,
         "status_detail": status_detail,
         "available": available,
-        "deadline_required": deadline_required,
+        "deadline_required": near_term_deadline_work,
         "pfs_required": pfs_required,
         "total_remaining": total_remaining,
         "difference": difference,
