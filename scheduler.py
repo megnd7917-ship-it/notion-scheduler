@@ -44,6 +44,18 @@ STATE_FILE = os.environ.get("SCHEDULER_STATE_FILE", ".scheduler_state.json")
 
 
 # ============================================================
+# NOTION ID NORMALIZATION
+# ============================================================
+
+
+def normalize_notion_id(value):
+    """Normalize Notion UUIDs so relation IDs match page IDs reliably."""
+    if not value:
+        return None
+    return str(value).replace("-", "").strip().lower()
+
+
+# ============================================================
 # WORKLOAD CONVERSIONS
 # ============================================================
 
@@ -480,38 +492,59 @@ def read_allocations():
 # ALLOCATION ACCOUNTING
 # ============================================================
 
-def allocation_minutes(allocation, master_tasks_by_id):
-    total = 0
-
-    for master_id in allocation["master_ids"]:
-        task = master_tasks_by_id.get(master_id)
-        if not task:
-            continue
-
-        total += workload_to_minutes(
-            allocation["allocation"],
-            task["unit"],
-        )
-
-    return total
-
-
 def calculate_completed_work(allocations, master_tasks_by_id):
+    """
+    Return completed allocation time keyed by Master To-Do page ID.
+
+    Completed Task Allocation pages are permanent history. They are never
+    deleted here. Their completed time is simply credited against the
+    corresponding Master task's original workload so the scheduler only
+    plans the unfinished portion.
+
+    Notion relation UUIDs are normalized before matching because the API can
+    expose the same page ID in slightly different UUID formatting.
+    """
     completed = {}
+
+    normalized_master_ids = {
+        normalize_notion_id(master_id): master_id
+        for master_id in master_tasks_by_id
+    }
 
     for allocation in allocations:
         if not allocation["completed"]:
             continue
 
-        minutes = allocation_minutes(
-            allocation,
-            master_tasks_by_id,
-        )
-
-        for master_id in allocation["master_ids"]:
-            completed[master_id] = (
-                completed.get(master_id, 0) + minutes
+        # A normal Task Allocation points to one Master task. If a relation
+        # ever contains more than one Master task, credit the allocation
+        # separately to each linked task using that task's own unit.
+        for raw_master_id in allocation["master_ids"]:
+            master_id = normalized_master_ids.get(
+                normalize_notion_id(raw_master_id)
             )
+            if not master_id:
+                print(
+                    "Warning: completed allocation "
+                    f'"{allocation["name"]}" points to a Master task '
+                    f'ID that was not found: {raw_master_id}'
+                )
+                continue
+
+            task = master_tasks_by_id[master_id]
+            minutes = workload_to_minutes(
+                allocation["allocation"],
+                task["unit"],
+            )
+            completed[master_id] = completed.get(master_id, 0) + minutes
+
+    if completed:
+        print("Completed Task Allocation time credited to Master tasks:")
+        for master_id, minutes in completed.items():
+            task = master_tasks_by_id.get(master_id)
+            if task:
+                print(
+                    f'  {task["task"]}: {format_minutes(minutes)} completed'
+                )
 
     return completed
 
@@ -580,49 +613,39 @@ def pfs_minutes_this_week(
 # DEPENDENCIES
 # ============================================================
 
-def normalize_notion_id(value):
-    """Normalize a Notion page ID for reliable comparisons."""
-    if not value:
-        return None
-    return str(value).replace("-", "").strip().lower()
-
-
 def build_dependency_graph(tasks):
-    """Build prerequisite/dependent relationships from Notion."""
     tasks_by_id = {task["page_id"]: task for task in tasks}
-    normalized_ids = {
-        normalize_notion_id(task["page_id"]): task["page_id"]
-        for task in tasks
+    normalized_task_ids = {
+        normalize_notion_id(task_id): task_id
+        for task_id in tasks_by_id
     }
     dependents = {task["page_id"]: set() for task in tasks}
 
     for task in tasks:
         valid_dependencies = set()
-
-        for dependency_id in task["dependencies"]:
-            matched_id = normalized_ids.get(
-                normalize_notion_id(dependency_id)
+        for raw_dependency_id in task["dependencies"]:
+            dependency_id = normalized_task_ids.get(
+                normalize_notion_id(raw_dependency_id)
             )
 
-            if normalize_notion_id(dependency_id) == normalize_notion_id(
-                task["page_id"]
-            ):
+            if dependency_id == task["page_id"]:
                 raise RuntimeError(
                     f'Task "{task["task"]}" depends on itself.'
                 )
 
-            if not matched_id:
+            if not dependency_id:
                 print(
                     f'Warning: dependency on an unavailable page was '
                     f'ignored for "{task["task"]}".'
                 )
                 continue
 
-            valid_dependencies.add(matched_id)
-            dependents[matched_id].add(task["page_id"])
+            valid_dependencies.add(dependency_id)
+            dependents[dependency_id].add(task["page_id"])
 
         task["dependencies"] = sorted(valid_dependencies)
 
+    # Detect cycles before scheduling.
     visiting = set()
     visited = set()
 
@@ -649,6 +672,18 @@ def build_dependency_graph(tasks):
         visit(task["page_id"], [task["page_id"]])
 
     return tasks_by_id, dependents
+
+
+def subtract_working_days(dt, days):
+    result = dt
+    remaining_days = days
+
+    while remaining_days > 0:
+        result -= timedelta(days=1)
+        if result.weekday() < 5:
+            remaining_days -= 1
+
+    return result
 
 
 def dependency_buffer_for_task(task):
@@ -1383,13 +1418,24 @@ def calculate_completed_pfs_minutes(allocations, master_tasks_by_id):
     """Return completed PFS project time for the current week."""
     completed_pfs_minutes = 0
 
+    normalized_master_ids = {
+        normalize_notion_id(master_id): master_id
+        for master_id in master_tasks_by_id
+    }
+
     for allocation in allocations:
         if not allocation["completed"]:
             continue
 
-        for master_id in allocation["master_ids"]:
-            task = master_tasks_by_id.get(master_id)
-            if not task or task["task"] == PFS_TASK_NAME:
+        for raw_master_id in allocation["master_ids"]:
+            master_id = normalized_master_ids.get(
+                normalize_notion_id(raw_master_id)
+            )
+            if not master_id:
+                continue
+
+            task = master_tasks_by_id[master_id]
+            if task["task"] == PFS_TASK_NAME:
                 continue
 
             if task["project"] == PFS_PROJECT_NAME:
