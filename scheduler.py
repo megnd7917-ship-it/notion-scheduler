@@ -338,58 +338,99 @@ def parse_datetime(value):
 
 
 # ============================================================
-# MASTER TO-DO LIST
+# SOURCE TASK DATABASES
 # ============================================================
 
-def read_master_tasks():
-    database_id = find_database("Master To-Do List")
-    data_source_id = get_data_source(database_id)
-    pages = query_data_source(data_source_id)
+def relation_target_databases(database_id):
+    """Return Task Allocations relation properties that point to task databases."""
+    database = notion("GET", f"databases/{database_id}")
+    targets = []
 
-    tasks = []
-    dependency_property_found = False
-
-    for page in pages:
-        name = title_value(page, "Task").strip()
-        if not name:
+    for name, prop in database.get("properties", {}).items():
+        if prop.get("type") != "relation":
             continue
 
-        page_dependency_property = find_dependency_property_name(page)
-        if page_dependency_property:
-            dependency_property_found = True
+        if name == "Focus time":
+            continue
 
-        workload = number_value(page, "Workload")
-        unit = select_value(page, "Unit")
+        target_id = prop.get("relation", {}).get("database_id")
+        if target_id:
+            targets.append((name, target_id))
 
-        tasks.append({
-            "page_id": page["id"],
-            "task": name,
-            "project": select_value(page, "Project"),
-            "deadline": date_value(page, "Deadline"),
-            "workload": workload,
-            "unit": unit,
-            "priority": select_value(page, "Priority level"),
-            "continuous": checkbox_value(page, "Continuous"),
-            "completed": checkbox_value(page, "Completed"),
-            "minutes": workload_to_minutes(workload, unit),
-            "dependencies": relation_ids(
-                page,
-                page_dependency_property,
-            ) if page_dependency_property else [],
-        })
+    return targets
 
-    if not dependency_property_found:
+
+def first_property_name(page, names, property_type=None):
+    properties = page.get("properties", {})
+
+    for name in names:
+        prop = properties.get(name)
+        if prop and (property_type is None or prop.get("type") == property_type):
+            return name
+
+    if property_type:
+        for name, prop in properties.items():
+            if prop.get("type") == property_type:
+                return name
+
+    return None
+
+
+def read_source_tasks():
+    """Read tasks directly from the small task databases.
+
+    Task Allocations contains one relation for each source task database.
+    Those relations tell the scheduler which databases to read, so there
+    is no master task database.
+    """
+    allocations_database_id = find_database("Task Allocations")
+    source_relations = relation_target_databases(allocations_database_id)
+
+    if not source_relations:
         raise RuntimeError(
-            'The Master To-Do List does not have the required "Blocked by" '
-            'relation. The scheduler expects "Blocked by" to be a relation '
-            'to the Master To-Do List, maintained by your Notion automation.'
+            'No task-database relations were found in "Task Allocations".'
         )
 
-    print(
-        f'Dependency property detected: "{DEPENDENCY_PROPERTY_NAME}" '
-        '(reading prerequisites from Notion automation)'
-    )
+    tasks = []
 
+    for relation_name, source_database_id in source_relations:
+        data_source_id = get_data_source(source_database_id)
+        pages = query_data_source(data_source_id)
+
+        for page in pages:
+            title_property = first_property_name(page, ["Name", "Task"], "title")
+            name = title_value(page, title_property).strip() if title_property else ""
+            if not name:
+                continue
+
+            workload = number_value(page, "Workload")
+            unit = select_value(page, "Unit")
+
+            # Empty/new pages are ignored rather than becoming zero-minute
+            # scheduler tasks.
+            if workload is None or not unit:
+                continue
+
+            tasks.append({
+                "page_id": page["id"],
+                "task": name,
+                "project": select_value(page, "Project"),
+                "deadline": date_value(page, "Deadline"),
+                "workload": workload,
+                "unit": unit,
+                "priority": select_value(page, "Priority") or select_value(page, "Priority level"),
+                "continuous": checkbox_value(page, "Continuous"),
+                "completed": checkbox_value(page, "Completed"),
+                "minutes": workload_to_minutes(workload, unit),
+                "dependencies": relation_ids(page, DEPENDENCY_PROPERTY_NAME),
+                "allocation_relation_property": relation_name,
+                "source_database_id": source_database_id,
+            })
+
+        print(f'  {relation_name}: {len(pages)} pages read')
+
+    print(f"Source task databases found: {len(source_relations)}")
+    print(f"Source tasks found: {len(tasks)}")
     return tasks
 
 
@@ -456,6 +497,18 @@ def read_focus_time():
 # TASK ALLOCATIONS
 # ============================================================
 
+def all_relation_ids(page):
+    """Return task IDs from every task relation on a Task Allocation page."""
+    ids = []
+    for name, prop in page.get("properties", {}).items():
+        if prop.get("type") != "relation":
+            continue
+        if name == "Focus time":
+            continue
+        ids.extend(item["id"] for item in prop.get("relation", []))
+    return ids
+
+
 def read_allocations():
     database_id = find_database("Task Allocations")
     data_source_id = get_data_source(database_id)
@@ -468,7 +521,7 @@ def read_allocations():
             "page_id": page["id"],
             "name": title_value(page, "Name"),
             "focus_ids": relation_ids(page, "Focus time"),
-            "master_ids": relation_ids(page, "Master To-Do List"),
+            "task_ids": all_relation_ids(page),
             "allocation": number_value(page, "Allocation") or 0,
             "completed": checkbox_value(page, "Completion"),
         })
@@ -480,11 +533,11 @@ def read_allocations():
 # ALLOCATION ACCOUNTING
 # ============================================================
 
-def allocation_minutes(allocation, master_tasks_by_id):
+def allocation_minutes(allocation, tasks_by_id):
     total = 0
 
-    for master_id in allocation["master_ids"]:
-        task = master_tasks_by_id.get(master_id)
+    for task_id in allocation["task_ids"]:
+        task = tasks_by_id.get(task_id)
         if not task:
             continue
 
@@ -496,7 +549,7 @@ def allocation_minutes(allocation, master_tasks_by_id):
     return total
 
 
-def calculate_completed_work(allocations, master_tasks_by_id):
+def calculate_completed_work(allocations, tasks_by_id):
     completed = {}
 
     for allocation in allocations:
@@ -505,12 +558,12 @@ def calculate_completed_work(allocations, master_tasks_by_id):
 
         minutes = allocation_minutes(
             allocation,
-            master_tasks_by_id,
+            tasks_by_id,
         )
 
-        for master_id in allocation["master_ids"]:
-            completed[master_id] = (
-                completed.get(master_id, 0) + minutes
+        for task_id in allocation["task_ids"]:
+            completed[task_id] = (
+                completed.get(task_id, 0) + minutes
             )
 
     return completed
@@ -525,7 +578,7 @@ def current_week_range():
 def pfs_minutes_this_week(
     allocations,
     all_focus_blocks,
-    master_tasks_by_id,
+    tasks_by_id,
 ):
     week_start, week_end = current_week_range()
 
@@ -540,8 +593,8 @@ def pfs_minutes_this_week(
         is_pfs = False
         pfs_unit = None
 
-        for master_id in allocation["master_ids"]:
-            task = master_tasks_by_id.get(master_id)
+        for task_id in allocation["task_ids"]:
+            task = tasks_by_id.get(task_id)
             if not task:
                 continue
 
@@ -799,7 +852,7 @@ def build_focus_fingerprint(all_focus_blocks):
     ])
 
 
-def build_master_fingerprint(tasks):
+def build_task_fingerprint(tasks):
     return stable_hash([
         (
             task["page_id"],
@@ -824,7 +877,7 @@ def build_completed_allocation_fingerprint(allocations):
     return stable_hash(sorted(
         (
             allocation["page_id"],
-            tuple(sorted(allocation["master_ids"])),
+            tuple(sorted(allocation["task_ids"])),
             allocation["completed"],
             allocation["allocation"],
         )
@@ -1249,6 +1302,8 @@ def create_allocation(allocation):
 
     display_amount = format_allocation(amount_minutes, unit)
     name = f'{task["task"]} — {display_amount}'
+    if allocation.get("is_final"):
+        name += " (final)"
 
     properties = {
         "Name": {
@@ -1273,7 +1328,7 @@ def create_allocation(allocation):
         "Completion": {
             "checkbox": False
         },
-        "Master To-Do List": {
+        task["allocation_relation_property"]: {
             "relation": [{
                 "id": task["page_id"]
             }]
@@ -1377,7 +1432,7 @@ def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
     }
 
 
-def calculate_completed_pfs_minutes(allocations, master_tasks_by_id):
+def calculate_completed_pfs_minutes(allocations, tasks_by_id):
     """Return completed PFS project time for the current week."""
     completed_pfs_minutes = 0
 
@@ -1385,8 +1440,8 @@ def calculate_completed_pfs_minutes(allocations, master_tasks_by_id):
         if not allocation["completed"]:
             continue
 
-        for master_id in allocation["master_ids"]:
-            task = master_tasks_by_id.get(master_id)
+        for task_id in allocation["task_ids"]:
+            task = tasks_by_id.get(task_id)
             if not task or task["task"] == PFS_TASK_NAME:
                 continue
 
@@ -1402,18 +1457,18 @@ def calculate_completed_pfs_minutes(allocations, master_tasks_by_id):
 
 def update_schedule_status(tasks, allocations, focus_blocks):
     """Update the single Current Schedule page and read its controls."""
-    master_tasks_by_id = {
+    tasks_by_id = {
         task["page_id"]: task
         for task in tasks
     }
 
     completed = calculate_completed_work(
         allocations,
-        master_tasks_by_id,
+        tasks_by_id,
     )
     completed_pfs_minutes = calculate_completed_pfs_minutes(
         allocations,
-        master_tasks_by_id,
+        tasks_by_id,
     )
 
     status_info = calculate_status(
@@ -1613,14 +1668,14 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
     print()
     print("Rebuilding future schedule...")
 
-    master_tasks_by_id = {
+    tasks_by_id = {
         task["page_id"]: task
         for task in tasks
     }
 
     completed = calculate_completed_work(
         allocations,
-        master_tasks_by_id,
+        tasks_by_id,
     )
 
     # Validate the dependency graph before deleting provisional work.
@@ -1630,7 +1685,7 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
     # weekly target. The synthetic PFS weekly-hours task does not count.
     completed_pfs_minutes = calculate_completed_pfs_minutes(
         allocations,
-        master_tasks_by_id,
+        tasks_by_id,
     )
 
     delete_incomplete_allocations(allocations)
@@ -1678,6 +1733,30 @@ def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
         completed_pfs_minutes,
     )
 
+    # Add "(final)" only to the last allocation for tasks that have
+    # more than one allocation overall. Completed allocations count as
+    # history; incomplete allocations were just removed and replaced.
+    completed_counts = {}
+    for allocation in allocations:
+        if not allocation["completed"]:
+            continue
+        for task_id in allocation["task_ids"]:
+            completed_counts[task_id] = completed_counts.get(task_id, 0) + 1
+
+    new_counts = {}
+    for allocation in new_allocations:
+        task_id = allocation["task"]["page_id"]
+        new_counts[task_id] = new_counts.get(task_id, 0) + 1
+
+    seen_new = {}
+    for allocation in new_allocations:
+        task_id = allocation["task"]["page_id"]
+        seen_new[task_id] = seen_new.get(task_id, 0) + 1
+        total_count = completed_counts.get(task_id, 0) + new_counts.get(task_id, 0)
+        allocation["is_final"] = (
+            total_count > 1 and seen_new[task_id] == new_counts[task_id]
+        )
+
     print(
         f"New allocations to create: {len(new_allocations)}"
     )
@@ -1714,11 +1793,11 @@ def main():
     print("========================================")
     print()
 
-    tasks = read_master_tasks()
+    tasks = read_source_tasks()
     all_focus_blocks, focus_blocks = read_focus_time()
     allocations = read_allocations()
 
-    print(f"Master tasks found: {len(tasks)}")
+    print(f"Source tasks found: {len(tasks)}")
     print(f"Focus Time blocks found: {len(focus_blocks)}")
     print(f"Task Allocations found: {len(allocations)}")
 
@@ -1736,14 +1815,14 @@ def main():
     state = load_state()
 
     focus_fingerprint = build_focus_fingerprint(all_focus_blocks)
-    master_fingerprint = build_master_fingerprint(tasks)
+    task_fingerprint = build_task_fingerprint(tasks)
     completed_allocation_fingerprint = (
         build_completed_allocation_fingerprint(allocations)
     )
 
     current_inputs = {
         "focus": focus_fingerprint,
-        "master": master_fingerprint,
+        "tasks": task_fingerprint,
         "completed_allocations": completed_allocation_fingerprint,
     }
 
@@ -1754,7 +1833,7 @@ def main():
     changed = (
         current_inputs != {
             "focus": state.get("focus"),
-            "master": state.get("master"),
+            "tasks": state.get("tasks"),
             "completed_allocations": state.get("completed_allocations"),
         }
     )
