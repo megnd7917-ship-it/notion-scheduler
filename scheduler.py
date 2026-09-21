@@ -1000,10 +1000,16 @@ def build_dependency_graph(tasks):
             )
 
             if dependency_id == task["page_id"]:
-                raise RuntimeError(
-                    f'Task "{task["task"]}" '
-                    f"depends on itself."
+                # A task should never block itself.  A self-link can be
+                # created accidentally in Notion, and treating it as a
+                # fatal dependency would prevent the entire scheduler from
+                # running.  Ignore the malformed self-link while preserving
+                # all genuine Blocked by relationships.
+                print(
+                    f'Warning: self-dependency on "{task["task"]}" '
+                    "was ignored."
                 )
+                continue
 
             if not dependency_id:
                 print(
