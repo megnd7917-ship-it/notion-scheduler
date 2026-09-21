@@ -3549,15 +3549,16 @@ def main():
             "detected."
         )
 
-    # There is intentionally no active-Focus-Time
-    # protection here. If the inputs change,
-    # the scheduler rebuilds the remaining
-    # schedule immediately.
-
-    # Automatic rebuilds do not churn an active Focus Time block.
-    # Explicit Reconsider requests intentionally bypass this protection.
+    # Do not defer the INITIAL population of Task Allocations.  An empty
+    # Task Allocations database is not a valid scheduled state, even if the
+    # workflow happens to run while a Focus Time block is active.
+    #
+    # For an already-populated schedule, however, automatic rebuilds should
+    # still avoid churning an active Focus Time block. Explicit Reconsider
+    # requests continue to bypass that protection.
     if (
-        not reconsider_requested
+        not needs_initial_allocation_build
+        and not reconsider_requested
         and should_defer_rebuild(
             all_focus_blocks
         )
