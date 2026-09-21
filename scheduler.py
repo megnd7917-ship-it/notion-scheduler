@@ -21,42 +21,26 @@ PLANNING_DAYS = 14
 MIN_CHUNK_MINUTES = 15
 PREFERRED_MAX_CHUNK_MINUTES = 45
 
+# Existing Notion dependency relation maintained by the user's
+# Notion automation. The scheduler reads the prerequisites from this
+# property; it does not create or modify dependency relationships.
 DEPENDENCY_PROPERTY_NAME = "Blocked by"
 
+# A prerequisite should be finished before the dependent task's
+# own work begins in earnest.  We therefore work backward from
+# the dependent's deadline, reserving:
+#   1) the dependent's remaining workload, and
+#   2) one full working day of breathing room.
+DEPENDENCY_BUFFER_WORKING_DAYS = 1
+
 PFS_TASK_NAME = "PFS weekly hours"
-PFS_DATABASE_NAME = "PFS To-Do"
+PFS_PROJECT_NAME = "PFS"
 PFS_WEEKLY_TARGET_MINUTES = 30 * 60
 
 CREATE_REQUEST_DELAY = 0.5
 MAX_RATE_LIMIT_RETRIES = 5
 
-STATE_FILE = os.environ.get(
-    "SCHEDULER_STATE_FILE",
-    ".scheduler_state.json",
-)
-
-
-# ============================================================
-# SOURCE DATABASES
-# ============================================================
-
-# Each source database has one corresponding one-page relation
-# in Task Allocations.
-#
-# The scheduler reads tasks directly from these databases.
-# There is no Master To-Do List.
-
-SOURCE_DATABASES = {
-    "JST To-Do": "JST Task",
-    "Reader To-Do": "Reader Task",
-    "Applications To-Do": "Applications Task",
-    "COM 210 To-Do": "COM 210 Task",
-    "ENL 248 To-Do": "ENL 248 Task",
-    "Independent Study To-Do": "Independent Study Task",
-    "LSAT To-Do": "LSAT Task",
-    "PFS To-Do": "PFS Task",
-    "Personal To-Do": "Personal Task",
-}
+STATE_FILE = os.environ.get("SCHEDULER_STATE_FILE", ".scheduler_state.json")
 
 
 # ============================================================
@@ -76,58 +60,40 @@ MINUTES_PER_UNIT = {
 def workload_to_minutes(workload, unit):
     if workload is None or not unit:
         return 0
-
     if unit not in MINUTES_PER_UNIT:
-        raise RuntimeError(
-            f'Unknown workload unit "{unit}".'
-        )
-
+        raise RuntimeError(f'Unknown workload unit "{unit}".')
     return workload * MINUTES_PER_UNIT[unit]
 
 
 def minutes_to_units(minutes, unit):
     if unit not in MINUTES_PER_UNIT:
-        raise RuntimeError(
-            f'Unknown workload unit "{unit}".'
-        )
-
+        raise RuntimeError(f'Unknown workload unit "{unit}".')
     return minutes / MINUTES_PER_UNIT[unit]
 
 
 def format_minutes(minutes):
     minutes = int(round(minutes))
-
     hours = minutes // 60
     remainder = minutes % 60
-
     parts = []
 
     if hours:
-        parts.append(
-            "1 hour" if hours == 1 else f"{hours} hours"
-        )
-
+        parts.append("1 hour" if hours == 1 else f"{hours} hours")
     if remainder:
-        parts.append(
-            "1 minute"
-            if remainder == 1
-            else f"{remainder} minutes"
-        )
+        parts.append("1 minute" if remainder == 1 else f"{remainder} minutes")
 
     return " ".join(parts) if parts else "0 minutes"
 
 
-def format_allocation(minutes, unit):
+def format_allocation(amount_minutes, unit):
     if unit in ("Hours", "Minutes"):
-        return format_minutes(minutes)
+        return format_minutes(amount_minutes)
 
-    amount = minutes_to_units(minutes, unit)
-
+    amount = minutes_to_units(amount_minutes, unit)
     if amount == int(amount):
         amount_text = str(int(amount))
     else:
         amount_text = f"{amount:g}"
-
     return f"{amount_text} {unit}"
 
 
@@ -146,7 +112,6 @@ def notion(method, path, **kwargs):
     url = f"https://api.notion.com/v1/{path}"
 
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-
         response = requests.request(
             method,
             url,
@@ -157,48 +122,38 @@ def notion(method, path, **kwargs):
         if response.ok:
             if not response.content:
                 return {}
-
             return response.json()
 
         if response.status_code == 429:
-
             retry_after = 3
-
             try:
                 data = response.json()
-
                 retry_after = int(
                     data.get("error", {})
                     .get("additional_data", {})
                     .get("retry_after", 3)
                 )
-
             except Exception:
                 pass
 
             if attempt >= MAX_RATE_LIMIT_RETRIES:
                 raise RuntimeError(
-                    "Notion rate limit persisted after "
-                    f"{MAX_RATE_LIMIT_RETRIES} retries: "
-                    f"{response.text}"
+                    f"Notion API rate limit persisted after "
+                    f"{MAX_RATE_LIMIT_RETRIES} retries: {response.text}"
                 )
 
             print(
-                "Notion rate limit reached. "
+                f"  Notion rate limit reached. "
                 f"Waiting {retry_after} seconds..."
             )
-
             time.sleep(max(1, retry_after))
             continue
 
         raise RuntimeError(
-            f"Notion API error "
-            f"{response.status_code}: {response.text}"
+            f"Notion API error {response.status_code}: {response.text}"
         )
 
-    raise RuntimeError(
-        "Notion API request failed."
-    )
+    raise RuntimeError("Notion API request failed.")
 
 
 def search_all(query):
@@ -206,59 +161,36 @@ def search_all(query):
     cursor = None
 
     while True:
-
-        payload = {
-            "query": query,
-            "page_size": 100,
-        }
-
+        payload = {"query": query, "page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
 
-        data = notion(
-            "POST",
-            "search",
-            json=payload,
-        )
-
-        results.extend(
-            data.get("results", [])
-        )
+        data = notion("POST", "search", json=payload)
+        results.extend(data.get("results", []))
 
         if not data.get("has_more"):
-            return results
-
+            break
         cursor = data.get("next_cursor")
+
+    return results
 
 
 def find_database(name):
     for obj in search_all(name):
-
         if obj.get("object") == "database":
-
             title = "".join(
                 item.get("plain_text", "")
                 for item in obj.get("title", [])
             ).strip()
-
             if title == name:
                 return obj["id"]
 
         elif obj.get("object") == "data_source":
-
-            database_id = (
-                obj.get("parent", {})
-                .get("database_id")
-            )
-
+            database_id = obj.get("parent", {}).get("database_id")
             if not database_id:
                 continue
 
-            database = notion(
-                "GET",
-                f"databases/{database_id}",
-            )
-
+            database = notion("GET", f"databases/{database_id}")
             title = "".join(
                 item.get("plain_text", "")
                 for item in database.get("title", [])
@@ -267,23 +199,16 @@ def find_database(name):
             if title == name:
                 return database_id
 
-    raise RuntimeError(
-        f'Could not find Notion database "{name}".'
-    )
+    raise RuntimeError(f'Could not find Notion database "{name}".')
 
 
 def get_data_source(database_id):
-    data = notion(
-        "GET",
-        f"databases/{database_id}",
-    )
-
+    data = notion("GET", f"databases/{database_id}")
     sources = data.get("data_sources", [])
 
     if not sources:
         raise RuntimeError(
-            f"No data source found for database "
-            f"{database_id}."
+            f"No data source found for database {database_id}."
         )
 
     return sources[0]["id"]
@@ -294,11 +219,7 @@ def query_data_source(data_source_id):
     cursor = None
 
     while True:
-
-        payload = {
-            "page_size": 100,
-        }
-
+        payload = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
 
@@ -307,49 +228,26 @@ def query_data_source(data_source_id):
             f"data_sources/{data_source_id}/query",
             json=payload,
         )
-
-        pages.extend(
-            data.get("results", [])
-        )
+        pages.extend(data.get("results", []))
 
         if not data.get("has_more"):
-            return pages
-
+            break
         cursor = data.get("next_cursor")
+
+    return pages
 
 
 def archive_page(page_id):
-    notion(
-        "PATCH",
-        f"pages/{page_id}",
-        json={
-            "in_trash": True
-        },
-    )
+    notion("PATCH", f"pages/{page_id}", json={"archived": True})
 
 
 # ============================================================
 # PROPERTY HELPERS
 # ============================================================
 
-def normalize_notion_id(value):
-    if not value:
-        return None
-
-    return (
-        str(value)
-        .replace("-", "")
-        .strip()
-        .lower()
-    )
-
-
 def title_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
-    )
-
-    if not prop or prop.get("type") != "title":
+    prop = page["properties"].get(property_name)
+    if not prop or prop["type"] != "title":
         return ""
 
     return "".join(
@@ -359,81 +257,34 @@ def title_value(page, property_name):
 
 
 def checkbox_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
-    )
-
-    if not prop or prop.get("type") != "checkbox":
+    prop = page["properties"].get(property_name)
+    if not prop or prop["type"] != "checkbox":
         return False
-
-    return bool(
-        prop.get("checkbox", False)
-    )
+    return prop.get("checkbox", False)
 
 
 def number_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
-    )
-
-    if not prop or prop.get("type") != "number":
+    prop = page["properties"].get(property_name)
+    if not prop or prop["type"] != "number":
         return None
-
     return prop.get("number")
 
 
 def select_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
-    )
-
-    if not prop or prop.get("type") != "select":
+    prop = page["properties"].get(property_name)
+    if not prop or prop["type"] != "select":
         return None
 
     option = prop.get("select")
-
-    if not option:
-        return None
-
-    return option.get("name")
-
-
-def relation_ids(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
-    )
-
-    if not prop or prop.get("type") != "relation":
-        return []
-
-    return [
-        item["id"]
-        for item in prop.get("relation", [])
-    ]
-
-
-def parse_datetime(value):
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-
-    dt = datetime.fromisoformat(value)
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=TZ)
-
-    return dt.astimezone(TZ)
+    return option.get("name") if option else None
 
 
 def date_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
-    )
-
-    if not prop or prop.get("type") != "date":
+    prop = page["properties"].get(property_name)
+    if not prop or prop["type"] != "date":
         return None
 
     date = prop.get("date")
-
     if not date:
         return None
 
@@ -445,95 +296,98 @@ def date_value(page, property_name):
 
     return {
         "start": parse_datetime(start),
-        "end": (
-            parse_datetime(end)
-            if end
-            else None
-        ),
+        "end": parse_datetime(end) if end else None,
     }
 
 
+def relation_ids(page, property_name):
+    prop = page["properties"].get(property_name)
+    if not prop or prop["type"] != "relation":
+        return []
+
+    return [item["id"] for item in prop.get("relation", [])]
+
+
+def find_dependency_property_name(page):
+    """Return the authoritative dependency relation property name.
+
+    The user's Notion automation maintains the native dependency
+    relationship through the "Blocked by" relation. The GitHub
+    scheduler only needs the upstream/prerequisite side of that
+    relationship, so it reads "Blocked by" and does not maintain a
+    second dependency relation of its own.
+    """
+    properties = page.get("properties", {})
+    prop = properties.get(DEPENDENCY_PROPERTY_NAME)
+
+    if prop and prop.get("type") == "relation":
+        return DEPENDENCY_PROPERTY_NAME
+
+    return None
+
+
+def parse_datetime(value):
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+
+    return dt.astimezone(TZ)
+
+
 # ============================================================
-# SOURCE TASKS
+# MASTER TO-DO LIST
 # ============================================================
 
-def read_tasks():
+def read_master_tasks():
+    database_id = find_database("Master To-Do List")
+    data_source_id = get_data_source(database_id)
+    pages = query_data_source(data_source_id)
+
     tasks = []
+    dependency_property_found = False
 
-    for database_name, relation_name in SOURCE_DATABASES.items():
+    for page in pages:
+        name = title_value(page, "Task").strip()
+        if not name:
+            continue
 
-        database_id = find_database(
-            database_name
-        )
+        page_dependency_property = find_dependency_property_name(page)
+        if page_dependency_property:
+            dependency_property_found = True
 
-        data_source_id = get_data_source(
-            database_id
-        )
+        workload = number_value(page, "Workload")
+        unit = select_value(page, "Unit")
 
-        pages = query_data_source(
-            data_source_id
-        )
-
-        for page in pages:
-
-            name = title_value(
+        tasks.append({
+            "page_id": page["id"],
+            "task": name,
+            "project": select_value(page, "Project"),
+            "deadline": date_value(page, "Deadline"),
+            "workload": workload,
+            "unit": unit,
+            "priority": select_value(page, "Priority level"),
+            "continuous": checkbox_value(page, "Continuous"),
+            "completed": checkbox_value(page, "Completed"),
+            "minutes": workload_to_minutes(workload, unit),
+            "dependencies": relation_ids(
                 page,
-                "Task",
-            ).strip()
+                page_dependency_property,
+            ) if page_dependency_property else [],
+        })
 
-            if not name:
-                continue
-
-            dependency_property = (
-                page.get("properties", {})
-                .get(DEPENDENCY_PROPERTY_NAME)
-            )
-
-            workload = number_value(
-                page,
-                "Workload",
-            )
-
-            unit = select_value(
-                page,
-                "Unit",
-            )
-
-            tasks.append({
-                "page_id": page["id"],
-                "task": name,
-                "database": database_name,
-                "relation_name": relation_name,
-                "deadline": date_value(
-                    page,
-                    "Deadline",
-                ),
-                "workload": workload,
-                "unit": unit,
-                "priority": select_value(
-                    page,
-                    "Priority",
-                ),
-                "continuous": checkbox_value(
-                    page,
-                    "Continuous",
-                ),
-                "completed": checkbox_value(
-                    page,
-                    "Completed",
-                ),
-                "dependencies": relation_ids(
-                    page,
-                    DEPENDENCY_PROPERTY_NAME,
-                ),
-                "minutes": workload_to_minutes(
-                    workload,
-                    unit,
-                ),
-            })
+    if not dependency_property_found:
+        raise RuntimeError(
+            'The Master To-Do List does not have the required "Blocked by" '
+            'relation. The scheduler expects "Blocked by" to be a relation '
+            'to the Master To-Do List, maintained by your Notion automation.'
+        )
 
     print(
-        f"Source tasks found: {len(tasks)}"
+        f'Dependency property detected: "{DEPENDENCY_PROPERTY_NAME}" '
+        '(reading prerequisites from Notion automation)'
     )
 
     return tasks
@@ -544,34 +398,17 @@ def read_tasks():
 # ============================================================
 
 def read_focus_time():
-    database_id = find_database(
-        "Focus time"
-    )
-
-    data_source_id = get_data_source(
-        database_id
-    )
-
-    pages = query_data_source(
-        data_source_id
-    )
+    database_id = find_database("Focus time")
+    data_source_id = get_data_source(database_id)
+    pages = query_data_source(data_source_id)
 
     now = datetime.now(TZ)
-
-    horizon = (
-        now
-        + timedelta(days=PLANNING_DAYS)
-    )
+    horizon = now + timedelta(days=PLANNING_DAYS)
 
     all_blocks = []
 
     for page in pages:
-
-        date = date_value(
-            page,
-            "Date",
-        )
-
+        date = date_value(page, "Date")
         if not date or not date["end"]:
             continue
 
@@ -579,41 +416,28 @@ def read_focus_time():
             "page_id": page["id"],
             "start": date["start"],
             "end": date["end"],
-            "last_edited_time": page.get(
-                "last_edited_time"
-            ),
+            "last_edited_time": page.get("last_edited_time"),
         })
 
-    all_blocks.sort(
-        key=lambda block: block["start"]
-    )
+    all_blocks.sort(key=lambda block: block["start"])
 
     schedulable_blocks = []
 
     for block in all_blocks:
-
         start = block["start"]
         end = block["end"]
 
         if end <= now:
             continue
-
         if start >= horizon:
             continue
 
         if start < now:
             start = now
-
         if end > horizon:
             end = horizon
 
-        minutes = int(
-            (
-                end - start
-            ).total_seconds()
-            / 60
-        )
-
+        minutes = int((end - start).total_seconds() / 60)
         if minutes <= 0:
             continue
 
@@ -625,10 +449,7 @@ def read_focus_time():
             "remaining": minutes,
         })
 
-    return (
-        all_blocks,
-        schedulable_blocks,
-    )
+    return all_blocks, schedulable_blocks
 
 
 # ============================================================
@@ -636,221 +457,77 @@ def read_focus_time():
 # ============================================================
 
 def read_allocations():
-    database_id = find_database(
-        "Task Allocations"
-    )
-
-    data_source_id = get_data_source(
-        database_id
-    )
-
-    pages = query_data_source(
-        data_source_id
-    )
+    database_id = find_database("Task Allocations")
+    data_source_id = get_data_source(database_id)
+    pages = query_data_source(data_source_id)
 
     allocations = []
 
     for page in pages:
-
-        source_links = {}
-
-        for relation_name in SOURCE_DATABASES.values():
-
-            ids = relation_ids(
-                page,
-                relation_name,
-            )
-
-            if ids:
-                source_links[
-                    relation_name
-                ] = ids
-
         allocations.append({
             "page_id": page["id"],
-            "name": title_value(
-                page,
-                "Name",
-            ),
-            "source_links": source_links,
-            "focus_ids": relation_ids(
-                page,
-                "Focus time",
-            ),
-            "allocation": (
-                number_value(
-                    page,
-                    "Allocation",
-                )
-                or 0
-            ),
-            "unit": select_value(
-                page,
-                "Unit",
-            ),
-            "completed": checkbox_value(
-                page,
-                "Completion",
-            ),
-            "overdue": checkbox_value(
-                page,
-                "Overdue",
-            ),
-            "hold": checkbox_value(
-                page,
-                "Hold",
-            ),
+            "name": title_value(page, "Name"),
+            "focus_ids": relation_ids(page, "Focus time"),
+            "master_ids": relation_ids(page, "Master To-Do List"),
+            "allocation": number_value(page, "Allocation") or 0,
+            "completed": checkbox_value(page, "Completion"),
         })
 
     return allocations
 
 
-def allocation_task_id(
-    allocation,
-    tasks_by_id,
-):
-    normalized_ids = {
-        normalize_notion_id(page_id): page_id
-        for page_id in tasks_by_id
-    }
+# ============================================================
+# ALLOCATION ACCOUNTING
+# ============================================================
 
-    matches = []
+def allocation_minutes(allocation, master_tasks_by_id):
+    total = 0
 
-    for ids in allocation[
-        "source_links"
-    ].values():
+    for master_id in allocation["master_ids"]:
+        task = master_tasks_by_id.get(master_id)
+        if not task:
+            continue
 
-        for raw_id in ids:
-
-            task_id = normalized_ids.get(
-                normalize_notion_id(raw_id)
-            )
-
-            if task_id:
-                matches.append(task_id)
-
-    if not matches:
-        return None
-
-    if len(matches) > 1:
-        names = [
-            tasks_by_id[task_id]["task"]
-            for task_id in matches
-        ]
-
-        print(
-            f'Warning: allocation '
-            f'"{allocation["name"]}" is linked '
-            f"to multiple tasks: "
-            f"{', '.join(names)}. "
-            f"It will be credited once."
+        total += workload_to_minutes(
+            allocation["allocation"],
+            task["unit"],
         )
 
-    return matches[0]
+    return total
 
 
-def allocation_minutes(
-    allocation,
-    task,
-):
-    unit = (
-        allocation.get("unit")
-        or task["unit"]
-    )
-
-    return workload_to_minutes(
-        allocation["allocation"],
-        unit,
-    )
-
-
-def calculate_completed_work(
-    allocations,
-    tasks_by_id,
-):
+def calculate_completed_work(allocations, master_tasks_by_id):
     completed = {}
 
     for allocation in allocations:
-
         if not allocation["completed"]:
-            continue
-
-        task_id = allocation_task_id(
-            allocation,
-            tasks_by_id,
-        )
-
-        if not task_id:
             continue
 
         minutes = allocation_minutes(
             allocation,
-            tasks_by_id[task_id],
+            master_tasks_by_id,
         )
 
-        completed[task_id] = (
-            completed.get(task_id, 0)
-            + minutes
-        )
+        for master_id in allocation["master_ids"]:
+            completed[master_id] = (
+                completed.get(master_id, 0) + minutes
+            )
 
     return completed
 
 
-# ============================================================
-# HOLD
-# ============================================================
-
-def held_task_ids(
-    allocations,
-    tasks_by_id,
-):
-    held = set()
-
-    for allocation in allocations:
-
-        if allocation["completed"]:
-            continue
-
-        if not allocation["hold"]:
-            continue
-
-        task_id = allocation_task_id(
-            allocation,
-            tasks_by_id,
-        )
-
-        if task_id:
-            held.add(task_id)
-
-    return held
-
-
-# ============================================================
-# PFS
-# ============================================================
-
 def current_week_range():
     today = datetime.now(TZ).date()
-
-    monday = (
-        today
-        - timedelta(days=today.weekday())
-    )
-
-    return (
-        monday,
-        monday + timedelta(days=7),
-    )
+    monday = today - timedelta(days=today.weekday())
+    return monday, monday + timedelta(days=7)
 
 
-def calculate_completed_pfs_minutes(
+def pfs_minutes_this_week(
     allocations,
-    tasks_by_id,
     all_focus_blocks,
+    master_tasks_by_id,
 ):
-    week_start, week_end = (
-        current_week_range()
-    )
+    week_start, week_end = current_week_range()
 
     blocks_by_id = {
         block["page_id"]: block
@@ -860,44 +537,41 @@ def calculate_completed_pfs_minutes(
     total = 0
 
     for allocation in allocations:
+        is_pfs = False
+        pfs_unit = None
 
-        if not allocation["completed"]:
+        for master_id in allocation["master_ids"]:
+            task = master_tasks_by_id.get(master_id)
+            if not task:
+                continue
+
+            # The synthetic weekly-hours task is a scheduling target,
+            # not actual PFS work. It must never count toward itself.
+            if task["task"] == PFS_TASK_NAME:
+                continue
+
+            if task["project"] == PFS_PROJECT_NAME:
+                is_pfs = True
+                pfs_unit = task["unit"]
+                break
+
+        if not is_pfs:
             continue
 
-        task_id = allocation_task_id(
-            allocation,
-            tasks_by_id,
-        )
-
-        if not task_id:
+        if pfs_unit not in MINUTES_PER_UNIT:
             continue
 
-        task = tasks_by_id[task_id]
+        for focus_id in allocation["focus_ids"]:
+            block = blocks_by_id.get(focus_id)
+            if not block:
+                continue
 
-        if task["database"] != PFS_DATABASE_NAME:
-            continue
-
-        if task["task"] == PFS_TASK_NAME:
-            continue
-
-        in_current_week = any(
-            focus_id in blocks_by_id
-            and
-            week_start
-            <= blocks_by_id[
-                focus_id
-            ]["start"].date()
-            <
-            week_end
-            for focus_id
-            in allocation["focus_ids"]
-        )
-
-        if in_current_week:
-            total += allocation_minutes(
-                allocation,
-                task,
-            )
+            date = block["start"].date()
+            if week_start <= date < week_end:
+                total += workload_to_minutes(
+                    allocation["allocation"],
+                    pfs_unit,
+                )
 
     return total
 
@@ -907,86 +581,42 @@ def calculate_completed_pfs_minutes(
 # ============================================================
 
 def build_dependency_graph(tasks):
-    tasks_by_id = {
-        task["page_id"]: task
-        for task in tasks
-    }
-
-    normalized_ids = {
-        normalize_notion_id(task_id): task_id
-        for task_id in tasks_by_id
-    }
-
-    dependents = {
-        task["page_id"]: set()
-        for task in tasks
-    }
+    tasks_by_id = {task["page_id"]: task for task in tasks}
+    dependents = {task["page_id"]: set() for task in tasks}
 
     for task in tasks:
-
         valid_dependencies = set()
-
-        for raw_dependency_id in task[
-            "dependencies"
-        ]:
-
-            dependency_id = normalized_ids.get(
-                normalize_notion_id(
-                    raw_dependency_id
-                )
-            )
-
+        for dependency_id in task["dependencies"]:
+            # A task cannot meaningfully depend on itself.
+            # Ignore an accidental self-link rather than stopping the
+            # entire scheduler.
             if dependency_id == task["page_id"]:
-                raise RuntimeError(
-                    f'Task "{task["task"]}" '
-                    f"depends on itself."
-                )
-
-            if not dependency_id:
                 print(
-                    f'Warning: dependency on an '
-                    f'unavailable page was ignored '
-                    f'for "{task["task"]}".'
+                    f'Warning: self-dependency ignored for "{task["task"]}".'
                 )
                 continue
 
-            valid_dependencies.add(
-                dependency_id
-            )
+            if dependency_id not in tasks_by_id:
+                print(
+                    f'Warning: dependency on an unavailable page was '
+                    f'ignored for "{task["task"]}".'
+                )
+                continue
 
-            dependents[
-                dependency_id
-            ].add(
-                task["page_id"]
-            )
+            valid_dependencies.add(dependency_id)
+            dependents[dependency_id].add(task["page_id"])
 
-        task["dependencies"] = sorted(
-            valid_dependencies
-        )
+        task["dependencies"] = sorted(valid_dependencies)
 
+    # Detect cycles before scheduling.
     visiting = set()
     visited = set()
 
     def visit(task_id, path):
-
         if task_id in visiting:
-
-            cycle_start = path.index(
-                task_id
-            )
-
-            cycle_ids = (
-                path[cycle_start:]
-                + [task_id]
-            )
-
-            cycle_names = [
-                tasks_by_id[
-                    task_id
-                ]["task"]
-                for task_id in cycle_ids
-            ]
-
+            cycle_start = path.index(task_id)
+            cycle_ids = path[cycle_start:] + [task_id]
+            cycle_names = [tasks_by_id[i]["task"] for i in cycle_ids]
             raise RuntimeError(
                 "Circular dependency detected: "
                 + " -> ".join(cycle_names)
@@ -996,202 +626,123 @@ def build_dependency_graph(tasks):
             return
 
         visiting.add(task_id)
-
-        for dependency_id in tasks_by_id[
-            task_id
-        ]["dependencies"]:
-
-            visit(
-                dependency_id,
-                path + [dependency_id],
-            )
-
+        for dependency_id in tasks_by_id[task_id]["dependencies"]:
+            visit(dependency_id, path + [dependency_id])
         visiting.remove(task_id)
         visited.add(task_id)
 
     for task in tasks:
-        visit(
-            task["page_id"],
-            [task["page_id"]],
-        )
+        visit(task["page_id"], [task["page_id"]])
 
-    return (
-        tasks_by_id,
-        dependents,
+    return tasks_by_id, dependents
+
+
+def subtract_working_days(dt, days):
+    result = dt
+    remaining_days = days
+
+    while remaining_days > 0:
+        result -= timedelta(days=1)
+        if result.weekday() < 5:
+            remaining_days -= 1
+
+    return result
+
+
+def dependency_buffer_for_task(task):
+    return timedelta(
+        days=DEPENDENCY_BUFFER_WORKING_DAYS
     )
 
 
-def task_planning_deadline(task):
-    if not task["deadline"]:
-        return None
+def calculate_dependency_deadlines(tasks, remaining):
+    """
+    Work backward through dependency chains.
 
-    return (
-        task["deadline"]["start"]
-        - timedelta(days=1)
-    )
+    For a prerequisite A -> B, B's effective deadline becomes the
+    latest point at which B can still be comfortably completed. A's
+    effective deadline is then:
 
+        B effective deadline
+        - B remaining workload
+        - one full working day of buffer
 
-def actual_deadline_end(task):
-    deadline = task.get("deadline")
-
-    if not deadline:
-        return None
-
-    if deadline.get("end"):
-        return deadline["end"]
-
-    return deadline["start"].replace(
-        hour=23,
-        minute=59,
-        second=59,
-        microsecond=999999,
-    )
-
-
-def deadline_day_kind(task, now):
-    deadline = actual_deadline_end(task)
-
-    if not deadline:
-        return None
-
-    today = now.date()
-
-    deadline_date = deadline.date()
-
-    if deadline_date < today:
-        return "overdue"
-
-    if deadline_date == today:
-        return "today"
-
-    return "future"
-
-
-def calculate_dependency_deadlines(
-    tasks,
-    remaining,
-    held_ids,
-):
-    tasks_by_id, dependents = (
-        build_dependency_graph(tasks)
-    )
+    The earliest constraint wins when a task has both its own deadline
+    and a downstream dependency deadline.
+    """
+    tasks_by_id, dependents = build_dependency_graph(tasks)
 
     effective = {
-        task_id: task_planning_deadline(task)
-        for task_id, task
-        in tasks_by_id.items()
+        task_id: task["deadline"]["start"]
+        if task["deadline"]
+        else None
+        for task_id, task in tasks_by_id.items()
     }
 
     visiting = set()
 
     def solve(task_id):
-
         if task_id in visiting:
-            raise RuntimeError(
-                "Circular dependency detected."
-            )
+            raise RuntimeError("Circular dependency detected while calculating deadlines.")
 
         visiting.add(task_id)
 
-        for dependent_id in dependents[
-            task_id
-        ]:
-
+        # First make sure all downstream constraints are known.
+        for dependent_id in dependents[task_id]:
             solve(dependent_id)
 
-            dependent = tasks_by_id[
-                dependent_id
-            ]
+            dependent = tasks_by_id[dependent_id]
+            dependent_remaining = remaining.get(dependent_id, 0)
 
-            if dependent["completed"]:
+            # A fully completed downstream task creates no future
+            # scheduling pressure.
+            if dependent["completed"] or dependent_remaining <= 0:
                 continue
 
-            if dependent_id in held_ids:
-                continue
-
-            dependent_remaining = remaining.get(
-                dependent_id,
-                0,
-            )
-
-            if dependent_remaining <= 0:
-                continue
-
-            downstream_deadline = effective.get(
-                dependent_id
-            )
-
+            downstream_deadline = effective.get(dependent_id)
             if downstream_deadline is None:
                 continue
 
             candidate = (
                 downstream_deadline
-                - timedelta(
-                    minutes=dependent_remaining
-                )
-                - timedelta(days=1)
+                - timedelta(minutes=dependent_remaining)
+                - dependency_buffer_for_task(dependent)
             )
 
-            own_deadline = effective.get(
-                task_id
-            )
-
-            if (
-                own_deadline is None
-                or candidate < own_deadline
-            ):
+            own_deadline = effective.get(task_id)
+            if own_deadline is None or candidate < own_deadline:
                 effective[task_id] = candidate
 
         visiting.remove(task_id)
+        return effective.get(task_id)
 
     for task in tasks:
         solve(task["page_id"])
 
     for task in tasks:
-        task["effective_deadline"] = (
-            effective.get(
-                task["page_id"]
-            )
-        )
+        task["effective_deadline"] = effective.get(task["page_id"])
 
-    return (
-        tasks_by_id,
-        dependents,
-    )
+    return tasks_by_id, dependents
 
 
-def dependency_blocked(
-    task,
-    tasks_by_id,
-    completed,
-    held_ids,
-):
-    for dependency_id in task[
-        "dependencies"
-    ]:
+def dependency_blocked(task, tasks_by_id, completed, remaining):
+    if not task["dependencies"]:
+        return False
 
-        dependency = tasks_by_id.get(
-            dependency_id
-        )
-
+    for dependency_id in task["dependencies"]:
+        dependency = tasks_by_id.get(dependency_id)
         if not dependency:
             continue
 
+        # A dependency is satisfied only by ACTUAL completed work,
+        # not merely because the prerequisite has been allocated in the
+        # new schedule. This prevents a dependent task from being placed
+        # in the same rebuild before its prerequisite is actually done.
         if dependency["completed"]:
             continue
 
-        # A held prerequisite is temporarily
-        # ignored so the dependent can proceed.
-        if dependency_id in held_ids:
-            continue
-
-        if (
-            completed.get(
-                dependency_id,
-                0,
-            )
-            >= dependency["minutes"]
-        ):
+        completed_minutes = completed.get(dependency_id, 0)
+        if completed_minutes >= dependency["minutes"]:
             continue
 
         return True
@@ -1199,1684 +750,25 @@ def dependency_blocked(
     return False
 
 
-def dependency_depth(
-    task_id,
-    tasks_by_id,
-    cache,
-):
+def dependency_depth(task_id, tasks_by_id, cache=None):
+    if cache is None:
+        cache = {}
+
     if task_id in cache:
         return cache[task_id]
 
     task = tasks_by_id[task_id]
-
     if not task["dependencies"]:
         cache[task_id] = 0
         return 0
 
-    valid_dependencies = [
-        dependency_id
-        for dependency_id
-        in task["dependencies"]
-        if dependency_id in tasks_by_id
-    ]
-
-    if not valid_dependencies:
-        cache[task_id] = 0
-        return 0
-
-    depth = (
-        1
-        + max(
-            dependency_depth(
-                dependency_id,
-                tasks_by_id,
-                cache,
-            )
-            for dependency_id
-            in valid_dependencies
-        )
+    depth = 1 + max(
+        dependency_depth(dep_id, tasks_by_id, cache)
+        for dep_id in task["dependencies"]
+        if dep_id in tasks_by_id
     )
-
     cache[task_id] = depth
-
     return depth
-
-
-# ============================================================
-# SCHEDULING RULES
-# ============================================================
-
-def priority_multiplier(priority):
-    if priority == "High":
-        return 1.20
-
-    if priority == "Medium":
-        return 1.05
-
-    return 1.00
-
-
-def hours_until_effective_deadline(
-    task,
-    now,
-):
-    deadline = task.get(
-        "effective_deadline"
-    )
-
-    if not deadline:
-        return None
-
-    return (
-        deadline - now
-    ).total_seconds() / 3600
-
-
-def task_score(
-    task,
-    remaining_minutes,
-    now,
-    same_day_minutes,
-    dependency_depth_value,
-):
-    hours = hours_until_effective_deadline(
-        task,
-        now,
-    )
-
-    deadline_kind = deadline_day_kind(
-        task,
-        now,
-    )
-
-    is_low = (
-        task.get("priority")
-        == "Low"
-    )
-
-    if (
-        deadline_kind == "overdue"
-        and not is_low
-    ):
-        deadline_score = 1_000_000_000
-
-    elif (
-        deadline_kind == "today"
-        and not is_low
-    ):
-        deadline_score = 500_000_000
-
-    elif hours is None:
-        deadline_score = 0.1
-
-    elif hours <= 0 and not is_low:
-        deadline_score = 100_000_000
-
-    elif hours <= 0:
-        deadline_score = 0.5
-
-    else:
-        deadline_score = (
-            100
-            / ((hours + 1) ** 2)
-        )
-
-    score = (
-        deadline_score
-        * priority_multiplier(
-            task["priority"]
-        )
-    )
-
-    score += min(
-        2.0,
-        remaining_minutes / 120,
-    )
-
-    if dependency_depth_value > 0:
-        score *= (
-            1
-            + min(
-                0.20,
-                0.05
-                * dependency_depth_value,
-            )
-        )
-
-    if same_day_minutes > 0:
-        score *= 0.85
-
-    return score
-
-
-def task_is_eligible(
-    task,
-    remaining_minutes,
-    block_start,
-    now,
-    tasks_by_id,
-    completed,
-    held_ids,
-):
-    if remaining_minutes <= 0:
-        return False
-
-    if task["completed"]:
-        return False
-
-    if task["page_id"] in held_ids:
-        return False
-
-    if dependency_blocked(
-        task,
-        tasks_by_id,
-        completed,
-        held_ids,
-    ):
-        return False
-
-    actual_deadline = actual_deadline_end(
-        task
-    )
-
-    deadline_kind = deadline_day_kind(
-        task,
-        now,
-    )
-
-    effective_deadline = task.get(
-        "effective_deadline"
-    )
-
-    # High/Medium overdue work can be
-    # scheduled in any future Focus Time.
-    if (
-        deadline_kind == "overdue"
-        and task["priority"] != "Low"
-    ):
-        return True
-
-    # High/Medium work due today is
-    # scheduled on the deadline day.
-    if (
-        deadline_kind == "today"
-        and task["priority"] != "Low"
-    ):
-        return (
-            block_start.date()
-            == now.date()
-        )
-
-    if not effective_deadline:
-        return True
-
-    if effective_deadline <= now:
-
-        if (
-            actual_deadline
-            and block_start >= actual_deadline
-        ):
-            return False
-
-        return True
-
-    if (
-        block_start
-        >= effective_deadline
-    ):
-        return False
-
-    if (
-        actual_deadline
-        and block_start >= actual_deadline
-    ):
-        return False
-
-    return True
-
-
-def choose_allocation_size(
-    task,
-    remaining_minutes,
-    available_minutes,
-    block_start,
-    now,
-):
-    maximum = min(
-        remaining_minutes,
-        available_minutes,
-    )
-
-    barriers = []
-
-    if (
-        task.get("effective_deadline")
-        and task["effective_deadline"] > now
-    ):
-        barriers.append(
-            task["effective_deadline"]
-        )
-
-    actual_deadline = actual_deadline_end(
-        task
-    )
-
-    if (
-        actual_deadline
-        and actual_deadline > now
-    ):
-        barriers.append(
-            actual_deadline
-        )
-
-    if barriers:
-
-        earliest_barrier = min(
-            barriers
-        )
-
-        deadline_capacity = int(
-            (
-                earliest_barrier
-                - block_start
-            ).total_seconds()
-            / 60
-        )
-
-        maximum = min(
-            maximum,
-            deadline_capacity,
-        )
-
-    if maximum <= 0:
-        return 0
-
-    deadline_forces_whole_task = (
-        task["priority"] != "Low"
-        and deadline_day_kind(
-            task,
-            now,
-        ) in {
-            "overdue",
-            "today",
-        }
-    )
-
-    if (
-        task["continuous"]
-        or deadline_forces_whole_task
-    ):
-
-        if remaining_minutes <= maximum:
-            return remaining_minutes
-
-        return 0
-
-    if maximum <= PREFERRED_MAX_CHUNK_MINUTES:
-        return maximum
-
-    remainder = (
-        remaining_minutes
-        - PREFERRED_MAX_CHUNK_MINUTES
-    )
-
-    if (
-        0 < remainder
-        <= MIN_CHUNK_MINUTES
-    ):
-        return remaining_minutes
-
-    return PREFERRED_MAX_CHUNK_MINUTES
-
-
-# ============================================================
-# PFS SCHEDULING
-# ============================================================
-
-def pfs_score(
-    block,
-    remaining_target,
-    week_end,
-):
-    block_date = block["start"].date()
-
-    is_weekday = (
-        block_date.weekday() < 5
-    )
-
-    days_left = max(
-        1,
-        (week_end - block_date).days,
-    )
-
-    score = (
-        0.35
-        if is_weekday
-        else 0.20
-    )
-
-    score += min(
-        2.0,
-        7.0 / days_left,
-    )
-
-    deficit_hours = (
-        remaining_target / 60
-    )
-
-    score += min(
-        2.5,
-        deficit_hours / 12,
-    )
-
-    return score
-
-
-# ============================================================
-# SCHEDULE TASKS
-# ============================================================
-
-def schedule_tasks(
-    tasks,
-    focus_blocks,
-    completed,
-    pfs_task,
-    completed_pfs_minutes,
-    held_ids,
-):
-    now = datetime.now(TZ)
-
-    remaining = {}
-
-    for task in tasks:
-
-        if task["completed"]:
-            continue
-
-        if task["task"] == PFS_TASK_NAME:
-            continue
-
-        if task["page_id"] in held_ids:
-            continue
-
-        remaining[
-            task["page_id"]
-        ] = max(
-            0,
-            task["minutes"]
-            - completed.get(
-                task["page_id"],
-                0,
-            ),
-        )
-
-    tasks_by_id, _ = (
-        build_dependency_graph(
-            tasks
-        )
-    )
-
-    calculate_dependency_deadlines(
-        tasks,
-        remaining,
-        held_ids,
-    )
-
-    dependency_depth_cache = {}
-
-    for task in tasks:
-        task["dependency_depth"] = (
-            dependency_depth(
-                task["page_id"],
-                tasks_by_id,
-                dependency_depth_cache,
-            )
-        )
-
-    pfs_remaining_target = max(
-        0,
-        PFS_WEEKLY_TARGET_MINUTES
-        - completed_pfs_minutes,
-    )
-
-    new_allocations = []
-
-    for block in focus_blocks:
-
-        excluded_for_block = set()
-
-        while (
-            block["remaining"]
-            >= MIN_CHUNK_MINUTES
-        ):
-
-            candidates = []
-
-            for task in tasks:
-
-                task_id = task["page_id"]
-
-                if task["task"] == PFS_TASK_NAME:
-                    continue
-
-                if task["completed"]:
-                    continue
-
-                if task_id in held_ids:
-                    continue
-
-                if task_id in excluded_for_block:
-                    continue
-
-                rem = remaining.get(
-                    task_id,
-                    0,
-                )
-
-                if rem <= 0:
-                    continue
-
-                if not task_is_eligible(
-                    task,
-                    rem,
-                    block["start"],
-                    datetime.now(TZ),
-                    tasks_by_id,
-                    completed,
-                    held_ids,
-                ):
-                    continue
-
-                same_day_minutes = sum(
-                    item["amount_minutes"]
-                    for item in new_allocations
-                    if (
-                        item["task"]["page_id"]
-                        == task_id
-                        and
-                        item["focus_page_start"].date()
-                        == block["start"].date()
-                    )
-                )
-
-                score = task_score(
-                    task,
-                    rem,
-                    now,
-                    same_day_minutes,
-                    task.get(
-                        "dependency_depth",
-                        0,
-                    ),
-                )
-
-                candidates.append(
-                    (
-                        "general",
-                        score,
-                        task,
-                    )
-                )
-
-            if (
-                pfs_task
-                and pfs_task["page_id"]
-                not in held_ids
-                and pfs_remaining_target
-                >= MIN_CHUNK_MINUTES
-                and
-                current_week_range()[0]
-                <= block["start"].date()
-                <
-                current_week_range()[1]
-            ):
-
-                candidates.append(
-                    (
-                        "pfs",
-                        pfs_score(
-                            block,
-                            pfs_remaining_target,
-                            current_week_range()[1],
-                        ),
-                        pfs_task,
-                    )
-                )
-
-            if not candidates:
-                break
-
-            urgent = [
-                candidate
-                for candidate
-                in candidates
-                if (
-                    candidate[0] == "general"
-                    and
-                    candidate[2].get(
-                        "effective_deadline"
-                    )
-                    and
-                    candidate[2][
-                        "effective_deadline"
-                    ] <= now
-                )
-            ]
-
-            if urgent:
-                candidates = urgent
-
-            candidates.sort(
-                key=lambda item: item[1],
-                reverse=True,
-            )
-
-            kind, _, chosen = candidates[0]
-
-            if kind == "pfs":
-
-                amount = min(
-                    block["remaining"],
-                    pfs_remaining_target,
-                    PREFERRED_MAX_CHUNK_MINUTES,
-                )
-
-                if amount < MIN_CHUNK_MINUTES:
-                    break
-
-                new_allocations.append({
-                    "task": chosen,
-                    "amount_minutes": amount,
-                    "focus_page_id": block["page_id"],
-                    "focus_page_start": block["start"],
-                })
-
-                block["remaining"] -= amount
-                pfs_remaining_target -= amount
-
-                continue
-
-            amount = choose_allocation_size(
-                chosen,
-                remaining[
-                    chosen["page_id"]
-                ],
-                block["remaining"],
-                block["start"],
-                now,
-            )
-
-            if amount <= 0:
-
-                excluded_for_block.add(
-                    chosen["page_id"]
-                )
-
-                continue
-
-            new_allocations.append({
-                "task": chosen,
-                "amount_minutes": amount,
-                "focus_page_id": block["page_id"],
-                "focus_page_start": block["start"],
-            })
-
-            block["remaining"] -= amount
-
-            remaining[
-                chosen["page_id"]
-            ] -= amount
-
-    return (
-        new_allocations,
-        remaining,
-    )
-
-
-def assign_schedule_order(
-    new_allocations,
-    now,
-):
-    def urgency_key(item):
-
-        task = item["task"]
-
-        kind = deadline_day_kind(
-            task,
-            now,
-        )
-
-        priority_rank = {
-            "High": 0,
-            "Medium": 1,
-            "Low": 3,
-        }.get(
-            task.get("priority"),
-            2,
-        )
-
-        if (
-            kind == "overdue"
-            and task.get("priority")
-            != "Low"
-        ):
-            tier = 0
-
-        elif (
-            kind == "today"
-            and task.get("priority")
-            != "Low"
-        ):
-            tier = 1
-
-        elif kind == "overdue":
-            tier = 4
-
-        elif kind == "today":
-            tier = 5
-
-        else:
-            tier = 2
-
-        effective = task.get(
-            "effective_deadline"
-        )
-
-        effective_key = (
-            effective.timestamp()
-            if effective
-            else float("inf")
-        )
-
-        block_key = (
-            item["focus_page_start"]
-            .timestamp()
-        )
-
-        return (
-            tier,
-            priority_rank,
-            effective_key,
-            block_key,
-            task["task"].lower(),
-        )
-
-    ordered = sorted(
-        new_allocations,
-        key=urgency_key,
-    )
-
-    for order, allocation in enumerate(
-        ordered,
-        start=1,
-    ):
-
-        allocation[
-            "schedule_order"
-        ] = order
-
-        allocation[
-            "overdue"
-        ] = (
-            deadline_day_kind(
-                allocation["task"],
-                now,
-            )
-            == "overdue"
-        )
-
-
-# ============================================================
-# CREATE ALLOCATION
-# ============================================================
-
-def create_allocation(
-    allocation,
-):
-    database_id = find_database(
-        "Task Allocations"
-    )
-
-    data_source_id = get_data_source(
-        database_id
-    )
-
-    task = allocation["task"]
-
-    if task["task"] == PFS_TASK_NAME:
-        unit = "Hours"
-    else:
-        unit = task["unit"]
-
-    amount_minutes = (
-        allocation["amount_minutes"]
-    )
-
-    display_amount = format_allocation(
-        amount_minutes,
-        unit,
-    )
-
-    name = (
-        f'{task["task"]} — '
-        f"{display_amount}"
-    )
-
-    relation_name = SOURCE_DATABASES[
-        task["database"]
-    ]
-
-    properties = {
-        "Name": {
-            "title": [
-                {
-                    "text": {
-                        "content": name
-                    }
-                }
-            ]
-        },
-
-        "Schedule Order": {
-            "number": allocation.get(
-                "schedule_order",
-                0,
-            )
-        },
-
-        "Overdue": {
-            "checkbox": allocation.get(
-                "overdue",
-                False,
-            )
-        },
-
-        "Focus time": {
-            "relation": [
-                {
-                    "id": allocation[
-                        "focus_page_id"
-                    ]
-                }
-            ]
-        },
-
-        "Allocation": {
-            "number": minutes_to_units(
-                amount_minutes,
-                unit,
-            )
-        },
-
-        "Unit": {
-            "select": {
-                "name": unit
-            }
-        },
-
-        "Completion": {
-            "checkbox": False
-        },
-
-        relation_name: {
-            "relation": [
-                {
-                    "id": task["page_id"]
-                }
-            ]
-        },
-    }
-
-    result = notion(
-        "POST",
-        "pages",
-        json={
-            "parent": {
-                "data_source_id":
-                    data_source_id
-            },
-            "properties": properties,
-        },
-    )
-
-    time.sleep(
-        CREATE_REQUEST_DELAY
-    )
-
-    return result
-
-
-# ============================================================
-# FINAL ALLOCATION LABEL
-# ============================================================
-
-def remove_final_label(name):
-    return (
-        name
-        .replace(" (final)", "")
-        .rstrip()
-    )
-
-
-def allocation_focus_start(
-    allocation,
-    blocks_by_id,
-):
-    starts = []
-
-    for focus_id in allocation[
-        "focus_ids"
-    ]:
-
-        block = blocks_by_id.get(
-            focus_id
-        )
-
-        if block:
-            starts.append(
-                block["start"]
-            )
-
-    if starts:
-        return max(starts)
-
-    return datetime.min.replace(
-        tzinfo=TZ
-    )
-
-
-def update_final_labels(
-    allocations,
-    tasks_by_id,
-    all_focus_blocks,
-):
-    blocks_by_id = {
-        block["page_id"]: block
-        for block in all_focus_blocks
-    }
-
-    grouped = {}
-
-    for allocation in allocations:
-
-        task_id = allocation_task_id(
-            allocation,
-            tasks_by_id,
-        )
-
-        if not task_id:
-            continue
-
-        grouped.setdefault(
-            task_id,
-            [],
-        ).append(
-            allocation
-        )
-
-    changed = 0
-
-    for task_id, task_allocations in grouped.items():
-
-        # Held allocations are visible, but are
-        # not part of the active scheduled sequence.
-        active_allocations = [
-            allocation
-            for allocation
-            in task_allocations
-            if not allocation["hold"]
-        ]
-
-        final_page_id = None
-
-        # "(final)" exists only when there are
-        # multiple active allocations.
-        if len(active_allocations) > 1:
-
-            final_allocation = max(
-                active_allocations,
-                key=lambda allocation:
-                    allocation_focus_start(
-                        allocation,
-                        blocks_by_id,
-                    ),
-            )
-
-            final_page_id = (
-                final_allocation["page_id"]
-            )
-
-        for allocation in task_allocations:
-
-            current_name = (
-                allocation["name"]
-            )
-
-            base_name = remove_final_label(
-                current_name
-            )
-
-            if (
-                final_page_id
-                == allocation["page_id"]
-            ):
-                desired_name = (
-                    f"{base_name} (final)"
-                )
-            else:
-                desired_name = base_name
-
-            if (
-                desired_name
-                == current_name
-            ):
-                continue
-
-            notion(
-                "PATCH",
-                f"pages/{allocation['page_id']}",
-                json={
-                    "properties": {
-                        "Name": {
-                            "title": [
-                                {
-                                    "text": {
-                                        "content":
-                                            desired_name
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                },
-            )
-
-            allocation[
-                "name"
-            ] = desired_name
-
-            changed += 1
-
-    if changed:
-        print(
-            "Updated '(final)' label on "
-            f"{changed} allocation(s)."
-        )
-
-
-# ============================================================
-# OVERDUE FLAGS
-# ============================================================
-
-def update_overdue_flags(
-    tasks,
-    allocations,
-    completed,
-):
-    today = datetime.now(
-        TZ
-    ).date()
-
-    tasks_by_id = {
-        task["page_id"]: task
-        for task in tasks
-    }
-
-    overdue_task_ids = set()
-
-    for task in tasks:
-
-        if task["completed"]:
-            continue
-
-        if task["task"] == PFS_TASK_NAME:
-            continue
-
-        remaining = max(
-            0,
-            task["minutes"]
-            - completed.get(
-                task["page_id"],
-                0,
-            ),
-        )
-
-        deadline = task.get(
-            "deadline"
-        )
-
-        if (
-            remaining > 0
-            and deadline
-            and deadline["start"].date()
-            < today
-        ):
-            overdue_task_ids.add(
-                task["page_id"]
-            )
-
-    changed = 0
-
-    for allocation in allocations:
-
-        task_id = allocation_task_id(
-            allocation,
-            tasks_by_id,
-        )
-
-        should_be_overdue = (
-            not allocation["completed"]
-            and task_id
-            in overdue_task_ids
-        )
-
-        if (
-            allocation["overdue"]
-            == should_be_overdue
-        ):
-            continue
-
-        notion(
-            "PATCH",
-            f"pages/{allocation['page_id']}",
-            json={
-                "properties": {
-                    "Overdue": {
-                        "checkbox":
-                            should_be_overdue
-                    }
-                }
-            },
-        )
-
-        allocation[
-            "overdue"
-        ] = should_be_overdue
-
-        changed += 1
-
-    if changed:
-        print(
-            f"Updated Overdue on "
-            f"{changed} allocation(s)."
-        )
-
-
-# ============================================================
-# SCHEDULE STATUS
-# ============================================================
-
-def calculate_status(
-    tasks,
-    completed,
-    focus_blocks,
-    completed_pfs_minutes,
-    held_ids,
-):
-    now = datetime.now(TZ)
-
-    horizon = (
-        now
-        + timedelta(days=PLANNING_DAYS)
-    )
-
-    available = sum(
-        block["remaining"]
-        for block in focus_blocks
-    )
-
-    remaining = {}
-
-    total_remaining = 0
-
-    for task in tasks:
-
-        if task["completed"]:
-            continue
-
-        if task["task"] == PFS_TASK_NAME:
-            continue
-
-        if task["page_id"] in held_ids:
-            continue
-
-        rem = max(
-            0,
-            task["minutes"]
-            - completed.get(
-                task["page_id"],
-                0,
-            ),
-        )
-
-        if rem > 0:
-
-            remaining[
-                task["page_id"]
-            ] = rem
-
-            total_remaining += rem
-
-    tasks_by_id, dependents = (
-        build_dependency_graph(tasks)
-    )
-
-    required_by = {}
-
-    for task in tasks:
-
-        if task["completed"]:
-            continue
-
-        if task["task"] == PFS_TASK_NAME:
-            continue
-
-        if task["page_id"] in held_ids:
-            continue
-
-        if task["priority"] == "Low":
-            continue
-
-        deadline = actual_deadline_end(
-            task
-        )
-
-        if deadline is not None:
-            required_by[
-                task["page_id"]
-            ] = deadline
-
-    visiting = set()
-
-    def solve_required_by(task_id):
-
-        if task_id in visiting:
-            raise RuntimeError(
-                "Circular dependency detected "
-                "while calculating status."
-            )
-
-        visiting.add(task_id)
-
-        for dependent_id in dependents.get(
-            task_id,
-            [],
-        ):
-
-            if dependent_id in held_ids:
-                continue
-
-            solve_required_by(
-                dependent_id
-            )
-
-            dependent = tasks_by_id[
-                dependent_id
-            ]
-
-            dependent_remaining = remaining.get(
-                dependent_id,
-                0,
-            )
-
-            if (
-                dependent["completed"]
-                or dependent_remaining <= 0
-            ):
-                continue
-
-            downstream = required_by.get(
-                dependent_id
-            )
-
-            if downstream is None:
-                continue
-
-            candidate = (
-                downstream
-                - timedelta(
-                    minutes=dependent_remaining
-                )
-                - timedelta(days=1)
-            )
-
-            own = required_by.get(
-                task_id
-            )
-
-            if (
-                own is None
-                or candidate < own
-            ):
-                required_by[
-                    task_id
-                ] = candidate
-
-        visiting.remove(task_id)
-
-    for task in tasks:
-        solve_required_by(
-            task["page_id"]
-        )
-
-    deadline_tasks = []
-
-    for task_id, deadline in (
-        required_by.items()
-    ):
-
-        if task_id not in remaining:
-            continue
-
-        if deadline > horizon:
-            continue
-
-        deadline_tasks.append(
-            (
-                deadline,
-                remaining[task_id],
-                tasks_by_id[task_id],
-            )
-        )
-
-    deadline_tasks.sort(
-        key=lambda item: item[0]
-    )
-
-    cumulative_required = 0
-
-    worst_shortfall = 0
-
-    worst_slack = None
-
-    for (
-        deadline,
-        rem,
-        task,
-    ) in deadline_tasks:
-
-        cumulative_required += rem
-
-        capacity_through_deadline = 0
-
-        for block in focus_blocks:
-
-            if (
-                block["start"]
-                >= deadline
-            ):
-                continue
-
-            usable_end = min(
-                block["end"],
-                deadline,
-            )
-
-            block_minutes = max(
-                0,
-                int(
-                    (
-                        usable_end
-                        - block["start"]
-                    ).total_seconds()
-                    / 60
-                ),
-            )
-
-            capacity_through_deadline += min(
-                block["remaining"],
-                block_minutes,
-            )
-
-        slack = (
-            capacity_through_deadline
-            - cumulative_required
-        )
-
-        if (
-            worst_slack is None
-            or slack < worst_slack
-        ):
-            worst_slack = slack
-
-        if slack < 0:
-            worst_shortfall = max(
-                worst_shortfall,
-                abs(slack),
-            )
-
-    pfs_active = any(
-        task["task"] == PFS_TASK_NAME
-        and not task["completed"]
-        for task in tasks
-    )
-
-    pfs_required = 0
-
-    if pfs_active:
-        pfs_required = max(
-            0,
-            PFS_WEEKLY_TARGET_MINUTES
-            - completed_pfs_minutes,
-        )
-
-    if worst_shortfall > 0:
-
-        status = (
-            "🟠 Needs attention"
-        )
-
-        status_detail = (
-            "🟠 Needs attention — "
-            f"{format_minutes(worst_shortfall)} "
-            "additional Focus Time needed "
-            "to meet an actual "
-            "High/Medium-priority deadline"
-        )
-
-        difference = -worst_shortfall
-
-    else:
-
-        status = "🟢 On track"
-
-        if worst_slack is None:
-
-            difference = available
-
-            status_detail = (
-                "🟢 On track — no hard "
-                "actual deadlines currently "
-                "require additional Focus Time"
-            )
-
-        else:
-
-            difference = worst_slack
-
-            status_detail = (
-                "🟢 On track — minimum "
-                "hard-deadline slack is "
-                f"{format_minutes(worst_slack)}"
-            )
-
-    return {
-        "status": status,
-        "status_detail": status_detail,
-        "available": available,
-        "deadline_required": sum(
-            rem
-            for _, rem, _
-            in deadline_tasks
-        ),
-        "pfs_required": pfs_required,
-        "total_remaining": total_remaining,
-        "difference": difference,
-        "pfs_active": pfs_active,
-    }
-
-
-def update_schedule_status(
-    tasks,
-    allocations,
-    focus_blocks,
-    completed,
-    completed_pfs_minutes,
-    held_ids,
-):
-    status_info = calculate_status(
-        tasks,
-        completed,
-        focus_blocks,
-        completed_pfs_minutes,
-        held_ids,
-    )
-
-    database_id = find_database(
-        "Schedule Status"
-    )
-
-    data_source_id = get_data_source(
-        database_id
-    )
-
-    pages = query_data_source(
-        data_source_id
-    )
-
-    current_schedule_page = None
-
-    for page in pages:
-
-        if (
-            title_value(
-                page,
-                "Name",
-            ).strip()
-            == "Current Schedule"
-        ):
-            current_schedule_page = page
-            break
-
-    if not current_schedule_page:
-        raise RuntimeError(
-            'Could not find the '
-            '"Current Schedule" page in '
-            '"Schedule Status".'
-        )
-
-    actual_property_names = set(
-        current_schedule_page
-        .get("properties", {})
-        .keys()
-    )
-
-    def resolve_property(
-        expected_name
-    ):
-        if expected_name in (
-            actual_property_names
-        ):
-            return expected_name
-
-        def normalize(name):
-            return "".join(
-                character.lower()
-                for character in name
-                if character.isalnum()
-            )
-
-        expected_normalized = normalize(
-            expected_name
-        )
-
-        for actual_name in (
-            actual_property_names
-        ):
-
-            if (
-                normalize(actual_name)
-                == expected_normalized
-            ):
-                return actual_name
-
-        raise RuntimeError(
-            f'Could not find Schedule Status '
-            f'property "{expected_name}".'
-        )
-
-    status_property = resolve_property(
-        "Status"
-    )
-
-    deadline_property = resolve_property(
-        "Near-Term Deadline Work"
-    )
-
-    pfs_property = resolve_property(
-        "PFS Weekly Target Remaining"
-    )
-
-    capacity_property = resolve_property(
-        "Schedule Capacity"
-    )
-
-    difference_property = resolve_property(
-        "Schedule difference"
-    )
-
-    updated_property = resolve_property(
-        "Last Updated"
-    )
-
-    reconsider_property = resolve_property(
-        "Reconsider"
-    )
-
-    reconsider_requested = checkbox_value(
-        current_schedule_page,
-        reconsider_property,
-    )
-
-    now = datetime.now(TZ)
-
-    properties = {
-        status_property: {
-            "select": {
-                "name":
-                    status_info["status"]
-            }
-        },
-
-        deadline_property: {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content":
-                            format_minutes(
-                                status_info[
-                                    "deadline_required"
-                                ]
-                            )
-                    },
-                }
-            ]
-        },
-
-        pfs_property: {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content": (
-                            format_minutes(
-                                status_info[
-                                    "pfs_required"
-                                ]
-                            )
-                            if
-                            status_info[
-                                "pfs_active"
-                            ]
-                            else
-                            "Inactive"
-                        )
-                    },
-                }
-            ]
-        },
-
-        capacity_property: {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content":
-                            format_minutes(
-                                status_info[
-                                    "available"
-                                ]
-                            )
-                    },
-                }
-            ]
-        },
-
-        difference_property: {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content": (
-                            f"+{format_minutes(status_info['difference'])} surplus"
-                            if
-                            status_info[
-                                "difference"
-                            ] >= 0
-                            else
-                            f"-{format_minutes(abs(status_info['difference']))} needed"
-                        )
-                    },
-                }
-            ]
-        },
-
-        updated_property: {
-            "date": {
-                "start":
-                    now.isoformat()
-            }
-        },
-    }
-
-    notion(
-        "PATCH",
-        f"pages/{current_schedule_page['id']}",
-        json={
-            "properties":
-                properties
-        },
-    )
-
-    print(
-        "Schedule Status updated."
-    )
-
-    print(
-        f"  {status_info['status_detail']}"
-    )
-
-    return {
-        "status_info": status_info,
-        "page_id":
-            current_schedule_page["id"],
-        "reconsider_requested":
-            reconsider_requested,
-        "reconsider_property":
-            reconsider_property,
-    }
-
-
-def clear_reconsider_request(
-    page_id,
-    property_name,
-):
-    notion(
-        "PATCH",
-        f"pages/{page_id}",
-        json={
-            "properties": {
-                property_name: {
-                    "checkbox": False
-                }
-            }
-        },
-    )
-
-    print(
-        "Reconsider request completed."
-    )
 
 
 # ============================================================
@@ -2890,251 +782,638 @@ def stable_hash(value):
         separators=(",", ":"),
         default=str,
     ).encode("utf-8")
-
-    return hashlib.sha256(
-        encoded
-    ).hexdigest()
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def build_task_fingerprint(tasks):
-    return stable_hash([
-        (
-            task["page_id"],
-            task["task"],
-            task["database"],
-
-            (
-                task["deadline"]["start"]
-                .isoformat()
-                if task["deadline"]
-                else None
-            ),
-
-            (
-                task["deadline"]["end"]
-                .isoformat()
-                if (
-                    task["deadline"]
-                    and
-                    task["deadline"]["end"]
-                )
-                else None
-            ),
-
-            task["workload"],
-            task["unit"],
-            task["priority"],
-            task["continuous"],
-            task["completed"],
-            tuple(
-                sorted(
-                    task["dependencies"]
-                )
-            ),
-        )
-
-        for task in sorted(
-            tasks,
-            key=lambda task:
-                task["page_id"],
-        )
-    ])
-
-
-def build_focus_fingerprint(
-    all_focus_blocks
-):
-    horizon = (
-        datetime.now(TZ)
-        + timedelta(
-            days=PLANNING_DAYS
-        )
-    )
-
+def build_focus_fingerprint(all_focus_blocks):
+    horizon = datetime.now(TZ) + timedelta(days=PLANNING_DAYS)
     return stable_hash([
         (
             block["page_id"],
             block["start"].isoformat(),
             block["end"].isoformat(),
-            block.get(
-                "last_edited_time"
-            ),
+            block.get("last_edited_time"),
         )
-
         for block in all_focus_blocks
-
         if block["start"] < horizon
     ])
 
 
-def build_allocation_fingerprint(
-    allocations,
-    tasks_by_id,
-):
-    rows = []
-
-    for allocation in allocations:
-
-        task_id = allocation_task_id(
-            allocation,
-            tasks_by_id,
+def build_master_fingerprint(tasks):
+    return stable_hash([
+        (
+            task["page_id"],
+            task["task"],
+            task["project"],
+            task["deadline"]["start"].isoformat()
+            if task["deadline"] else None,
+            task["deadline"]["end"].isoformat()
+            if task["deadline"] and task["deadline"]["end"] else None,
+            task["workload"],
+            task["unit"],
+            task["priority"],
+            task["continuous"],
+            task["completed"],
+            tuple(sorted(task["dependencies"])),
         )
+        for task in sorted(tasks, key=lambda t: t["page_id"])
+    ])
 
-        rows.append(
-            (
-                allocation["page_id"],
-                task_id,
-                allocation["completed"],
-                allocation["allocation"],
-                allocation["unit"],
-                allocation["hold"],
-            )
+
+def build_completed_allocation_fingerprint(allocations):
+    return stable_hash(sorted(
+        (
+            allocation["page_id"],
+            tuple(sorted(allocation["master_ids"])),
+            allocation["completed"],
+            allocation["allocation"],
         )
-
-    return stable_hash(
-        sorted(rows)
-    )
+        for allocation in allocations
+        if allocation["completed"]
+    ))
 
 
 def load_state():
     try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8",
-        ) as file:
-
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
             return json.load(file)
-
     except FileNotFoundError:
-
         return {}
-
     except json.JSONDecodeError:
-
-        print(
-            "Warning: scheduler state file "
-            "is invalid. Rebuilding."
-        )
-
+        print("Warning: scheduler state file is invalid; rebuilding.")
         return {}
 
 
 def save_state(state):
-    temporary_file = (
-        STATE_FILE + ".tmp"
-    )
+    temp_file = STATE_FILE + ".tmp"
 
-    with open(
-        temporary_file,
-        "w",
-        encoding="utf-8",
-    ) as file:
+    with open(temp_file, "w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2, sort_keys=True)
 
-        json.dump(
-            state,
-            file,
-            indent=2,
-            sort_keys=True,
-        )
-
-    os.replace(
-        temporary_file,
-        STATE_FILE,
-    )
+    os.replace(temp_file, STATE_FILE)
 
 
 # ============================================================
-# REBUILD
+# ACTIVE FOCUS TIME SAFETY
 # ============================================================
 
-def delete_incomplete_allocations(
-    allocations
-):
-    to_delete = [
-        allocation
-        for allocation in allocations
-        if (
-            not allocation["completed"]
-            and not allocation["hold"]
-        )
-    ]
+def active_focus_block(all_focus_blocks, now):
+    for block in all_focus_blocks:
+        if block["start"] <= now < block["end"]:
+            return block
+    return None
 
-    if not to_delete:
+
+def should_defer_rebuild(all_focus_blocks):
+    now = datetime.now(TZ)
+    block = active_focus_block(all_focus_blocks, now)
+
+    if block:
         print(
-            "No provisional allocations "
-            "to remove."
+            "A Focus Time block is currently active "
+            f"({block['start'].strftime('%I:%M %p').lstrip('0')}–"
+            f"{block['end'].strftime('%I:%M %p').lstrip('0')})."
         )
-        return
+        print("Rebuild deferred until that block has ended.")
+        return True
 
-    print(
-        f"Removing {len(to_delete)} "
-        "provisional allocation(s)..."
+    return False
+
+
+# ============================================================
+# SCHEDULING RULES
+# ============================================================
+
+def priority_multiplier(priority):
+    if priority == "High":
+        return 1.20
+    if priority == "Medium":
+        return 1.05
+    return 1.00
+
+
+def hours_until_effective_deadline(task, now):
+    deadline = task.get("effective_deadline")
+    if not deadline:
+        return None
+
+    return (deadline - now).total_seconds() / 3600
+
+
+def task_score(task, remaining_minutes, now, same_day_minutes, dependency_depth_value):
+    hours = hours_until_effective_deadline(task, now)
+
+    if hours is None:
+        deadline_score = 0.1
+    elif hours <= 0:
+        deadline_score = 100000000
+    else:
+        deadline_score = 100 / ((hours + 1) ** 2)
+
+    score = (
+        deadline_score
+        * priority_multiplier(task["priority"])
+        + min(2.0, remaining_minutes / 120)
     )
 
-    for allocation in to_delete:
+    # Dependencies create additional urgency, but the main driver is
+    # still the effective deadline calculated from downstream work.
+    if dependency_depth_value > 0:
+        score *= 1.0 + min(0.20, 0.05 * dependency_depth_value)
 
-        archive_page(
-            allocation["page_id"]
-        )
+    if same_day_minutes > 0:
+        score *= 0.85
+
+    return score
 
 
-def rebuild(
-    tasks,
-    all_focus_blocks,
-    focus_blocks,
-    allocations,
+def task_is_eligible(
+    task,
+    remaining_minutes,
+    block_start,
+    block_end,
+    now,
+    tasks_by_id,
+    completed,
+    remaining,
 ):
-    print()
-    print(
-        "Rebuilding future schedule..."
+    if remaining_minutes <= 0:
+        return False
+
+    if task["completed"]:
+        return False
+
+    # A dependent task cannot begin until all prerequisites are done.
+    if dependency_blocked(task, tasks_by_id, completed, remaining):
+        return False
+
+    effective_deadline = task.get("effective_deadline")
+
+    # No actual or inherited deadline: eligible normally.
+    if not effective_deadline:
+        return True
+
+    # If the effective deadline has passed, the task becomes urgent.
+    if effective_deadline <= now:
+        return True
+
+    # Preserve the existing deadline-day rule for the task's actual
+    # deadline. Dependency-derived deadlines are planning targets, so
+    # they remain schedulable right up to their barrier.
+    actual_deadline = task["deadline"]["start"] if task["deadline"] else None
+    if actual_deadline and actual_deadline.date() == now.date():
+        if remaining_minutes > MIN_CHUNK_MINUTES:
+            return False
+
+    # Never schedule work into or beyond the effective planning
+    # deadline unless that deadline has already become urgent.
+    if block_start >= effective_deadline:
+        return False
+
+    # Also preserve the actual hard deadline.
+    if actual_deadline and block_start >= actual_deadline:
+        return False
+
+    return True
+
+
+def choose_allocation_size(
+    task,
+    remaining_minutes,
+    available_minutes,
+    block_start,
+    block_end,
+    now,
+):
+    maximum = min(remaining_minutes, available_minutes)
+
+    # Hard barrier for both the task's own deadline and its
+    # dependency-derived planning deadline.
+    barriers = []
+    if task.get("effective_deadline") and task["effective_deadline"] > now:
+        barriers.append(task["effective_deadline"])
+    if task["deadline"] and task["deadline"]["start"] > now:
+        barriers.append(task["deadline"]["start"])
+
+    if barriers:
+        earliest_barrier = min(barriers)
+        deadline_capacity = int(
+            (earliest_barrier - block_start).total_seconds() / 60
+        )
+        maximum = min(maximum, deadline_capacity)
+
+    if maximum <= 0:
+        return 0
+
+    if task["continuous"]:
+        if remaining_minutes <= maximum:
+            return remaining_minutes
+        return 0
+
+    if maximum <= PREFERRED_MAX_CHUNK_MINUTES:
+        return maximum
+
+    chunk = PREFERRED_MAX_CHUNK_MINUTES
+    remainder = remaining_minutes - chunk
+
+    if 0 < remainder <= MIN_CHUNK_MINUTES:
+        return remaining_minutes
+
+    return chunk
+
+
+# ============================================================
+# PFS
+# ============================================================
+
+def pfs_score(block, remaining_target, week_end):
+    block_date = block["start"].date()
+    is_weekday = block_date.weekday() < 5
+
+    days_left = max(1, (week_end - block_date).days)
+
+    score = 0.35 if is_weekday else 0.20
+    score += min(2.0, 7.0 / days_left)
+
+    deficit_hours = remaining_target / 60
+    score += min(2.5, deficit_hours / 12)
+
+    return score
+
+
+# ============================================================
+# GENERAL + PFS COMPETITIVE SCHEDULING
+# ============================================================
+
+def schedule_tasks(
+    tasks,
+    focus_blocks,
+    completed,
+    pfs_task,
+    completed_pfs_minutes,
+):
+    now = datetime.now(TZ)
+
+    remaining = {}
+    for task in tasks:
+        if task["completed"]:
+            continue
+        if task["task"] == PFS_TASK_NAME:
+            continue
+
+        task_id = task["page_id"]
+        remaining[task_id] = max(
+            0,
+            task["minutes"] - completed.get(task_id, 0),
+        )
+
+    tasks_by_id, _ = build_dependency_graph(tasks)
+    dependency_depth_cache = {}
+
+    calculate_dependency_deadlines(tasks, remaining)
+
+    for task in tasks:
+        depth = dependency_depth(task["page_id"], tasks_by_id, dependency_depth_cache)
+        task["dependency_depth"] = depth
+
+    pfs_remaining_target = max(
+        0,
+        PFS_WEEKLY_TARGET_MINUTES - completed_pfs_minutes,
     )
 
-    tasks_by_id = {
+    new_allocations = []
+
+    for block in focus_blocks:
+        excluded_for_block = set()
+
+        while block["remaining"] >= MIN_CHUNK_MINUTES:
+            candidates = []
+
+            for task in tasks:
+                if task["task"] == PFS_TASK_NAME:
+                    continue
+                if task["completed"]:
+                    continue
+
+                task_id = task["page_id"]
+                if task_id in excluded_for_block:
+                    continue
+                rem = remaining.get(task_id, 0)
+                if rem <= 0:
+                    continue
+
+                if not task_is_eligible(
+                    task,
+                    rem,
+                    block["start"],
+                    block["end"],
+                    now,
+                    tasks_by_id,
+                    completed,
+                    remaining,
+                ):
+                    continue
+
+                same_day_minutes = 0
+                for allocation in new_allocations:
+                    if allocation["task"]["page_id"] != task_id:
+                        continue
+
+                    allocation_block = next(
+                        (
+                            candidate_block
+                            for candidate_block in focus_blocks
+                            if candidate_block["page_id"]
+                            == allocation["focus_page_id"]
+                        ),
+                        None,
+                    )
+
+                    if (
+                        allocation_block
+                        and allocation_block["start"].date()
+                        == block["start"].date()
+                    ):
+                        same_day_minutes += allocation["amount_minutes"]
+
+                score = task_score(
+                    task,
+                    rem,
+                    now,
+                    same_day_minutes,
+                    task.get("dependency_depth", 0),
+                )
+
+                candidates.append(("general", score, task))
+
+            # PFS is deliberately only a slight preference. It competes
+            # with ordinary work and yields to genuinely urgent work.
+            if (
+                pfs_task
+                and pfs_remaining_target >= MIN_CHUNK_MINUTES
+                and current_week_range()[0]
+                <= block["start"].date()
+                < current_week_range()[1]
+            ):
+                candidates.append((
+                    "pfs",
+                    pfs_score(
+                        block,
+                        pfs_remaining_target,
+                        current_week_range()[1],
+                    ),
+                    pfs_task,
+                ))
+
+            if not candidates:
+                break
+
+            overdue = [
+                candidate
+                for candidate in candidates
+                if (
+                    candidate[0] == "general"
+                    and candidate[2].get("effective_deadline")
+                    and candidate[2]["effective_deadline"] <= now
+                )
+            ]
+
+            if overdue:
+                candidates = overdue
+
+            candidates.sort(key=lambda item: item[1], reverse=True)
+            kind, _, chosen = candidates[0]
+
+            if kind == "pfs":
+                amount = min(
+                    block["remaining"],
+                    pfs_remaining_target,
+                    PREFERRED_MAX_CHUNK_MINUTES,
+                )
+
+                if amount < MIN_CHUNK_MINUTES:
+                    break
+
+                new_allocations.append({
+                    "task": chosen,
+                    "amount_minutes": amount,
+                    "focus_page_id": block["page_id"],
+                })
+
+                block["remaining"] -= amount
+                pfs_remaining_target -= amount
+                continue
+
+            amount = choose_allocation_size(
+                chosen,
+                remaining[chosen["page_id"]],
+                block["remaining"],
+                block["start"],
+                block["end"],
+                now,
+            )
+
+            if amount <= 0:
+                # The task cannot fit in this block before its current
+                # barrier. Temporarily exclude it from this block and
+                # let another eligible task use the available time.
+                excluded_for_block.add(chosen["page_id"])
+                continue
+
+            new_allocations.append({
+                "task": chosen,
+                "amount_minutes": amount,
+                "focus_page_id": block["page_id"],
+            })
+
+            block["remaining"] -= amount
+            remaining[chosen["page_id"]] -= amount
+
+    return new_allocations, remaining
+
+
+# ============================================================
+# CREATE TASK ALLOCATION
+# ============================================================
+
+def create_allocation(allocation):
+    database_id = find_database("Task Allocations")
+    data_source_id = get_data_source(database_id)
+
+    task = allocation["task"]
+    amount_minutes = allocation["amount_minutes"]
+
+    unit = task["unit"]
+    if task["task"] == PFS_TASK_NAME:
+        unit = "Hours"
+
+    display_amount = format_allocation(amount_minutes, unit)
+    name = f'{task["task"]} — {display_amount}'
+
+    properties = {
+        "Name": {
+            "title": [{
+                "text": {"content": name}
+            }]
+        },
+        "Focus time": {
+            "relation": [{
+                "id": allocation["focus_page_id"]
+            }]
+        },
+        "Allocation": {
+            "number": minutes_to_units(
+                amount_minutes,
+                unit,
+            )
+        },
+        "Unit": {
+            "select": {"name": unit}
+        },
+        "Completion": {
+            "checkbox": False
+        },
+        "Master To-Do List": {
+            "relation": [{
+                "id": task["page_id"]
+            }]
+        },
+    }
+
+    result = notion(
+        "POST",
+        "pages",
+        json={
+            "parent": {
+                "data_source_id": data_source_id
+            },
+            "properties": properties,
+        },
+    )
+
+    time.sleep(CREATE_REQUEST_DELAY)
+    return result
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+def calculate_status(tasks, completed, focus_blocks, completed_pfs_minutes=0):
+    """Calculate schedule sufficiency before scheduling consumes capacity."""
+    now = datetime.now(TZ)
+
+    available = sum(block["remaining"] for block in focus_blocks)
+
+    deadline_required = 0
+    total_remaining = 0
+
+    for task in tasks:
+        if task["completed"] or task["task"] == PFS_TASK_NAME:
+            continue
+
+        rem = max(0, task["minutes"] - completed.get(task["page_id"], 0))
+        if rem <= 0:
+            continue
+
+        total_remaining += rem
+
+        if task["deadline"]:
+            deadline = task["deadline"]["start"]
+            if deadline <= now + timedelta(days=18):
+                deadline_required += rem
+
+    pfs_required = 0
+    pfs_task_active = any(
+        task["task"] == PFS_TASK_NAME and not task["completed"]
+        for task in tasks
+    )
+    if pfs_task_active:
+        pfs_required = max(
+            0,
+            PFS_WEEKLY_TARGET_MINUTES - completed_pfs_minutes,
+        )
+
+    required = deadline_required + pfs_required
+    difference = available - required
+
+    if difference >= 0:
+        status = "🟢 On track"
+        status_detail = (
+            "🟢 On track — enough time available "
+            f"({format_minutes(difference)} surplus)"
+        )
+    else:
+        status = "🟠 Needs attention"
+        status_detail = (
+            "🟠 Needs attention — "
+            f"{format_minutes(abs(difference))} "
+            "additional Focus Time needed"
+        )
+
+    print(
+        f"Schedule capacity: {format_minutes(available)} Focus Time available"
+    )
+    print(
+        f"Near-term deadline work: {format_minutes(deadline_required)} required"
+    )
+    if pfs_task_active:
+        print(
+            f"PFS weekly target remaining: {format_minutes(pfs_required)}"
+        )
+    print(
+        f"Total remaining task work: {format_minutes(total_remaining)}"
+    )
+
+    return {
+        "status": status,
+        "status_detail": status_detail,
+        "available": available,
+        "deadline_required": deadline_required,
+        "pfs_required": pfs_required,
+        "total_remaining": total_remaining,
+        "difference": difference,
+        "pfs_active": pfs_task_active,
+    }
+
+
+def calculate_completed_pfs_minutes(allocations, master_tasks_by_id):
+    """Return completed PFS project time for the current week."""
+    completed_pfs_minutes = 0
+
+    for allocation in allocations:
+        if not allocation["completed"]:
+            continue
+
+        for master_id in allocation["master_ids"]:
+            task = master_tasks_by_id.get(master_id)
+            if not task or task["task"] == PFS_TASK_NAME:
+                continue
+
+            if task["project"] == PFS_PROJECT_NAME:
+                completed_pfs_minutes += workload_to_minutes(
+                    allocation["allocation"],
+                    task["unit"],
+                )
+                break
+
+    return completed_pfs_minutes
+
+
+def update_schedule_status(tasks, allocations, focus_blocks):
+    """Update the single Current Schedule page and read its controls."""
+    master_tasks_by_id = {
         task["page_id"]: task
         for task in tasks
     }
 
-    completed = (
-        calculate_completed_work(
-            allocations,
-            tasks_by_id,
-        )
-    )
-
-    held_ids = held_task_ids(
+    completed = calculate_completed_work(
         allocations,
-        tasks_by_id,
+        master_tasks_by_id,
     )
-
-    # Validate dependencies before
-    # deleting provisional allocations.
-    build_dependency_graph(tasks)
-
-    completed_pfs_minutes = (
-        calculate_completed_pfs_minutes(
-            allocations,
-            tasks_by_id,
-            all_focus_blocks,
-        )
-    )
-
-    delete_incomplete_allocations(
-        allocations
-    )
-
-    pfs_task = next(
-        (
-            task
-            for task in tasks
-            if (
-                task["task"]
-                == PFS_TASK_NAME
-                and not task["completed"]
-            )
-        ),
-        None,
+    completed_pfs_minutes = calculate_completed_pfs_minutes(
+        allocations,
+        master_tasks_by_id,
     )
 
     status_info = calculate_status(
@@ -3142,81 +1421,286 @@ def rebuild(
         completed,
         focus_blocks,
         completed_pfs_minutes,
-        held_ids,
+    )
+
+    database_id = find_database("Schedule Status")
+    data_source_id = get_data_source(database_id)
+    pages = query_data_source(data_source_id)
+
+    current_schedule_page = None
+    for page in pages:
+        name = title_value(page, "Name").strip()
+        if name == "Current Schedule":
+            current_schedule_page = page
+            break
+
+    if not current_schedule_page:
+        raise RuntimeError(
+            'Could not find the "Current Schedule" page in the '
+            '"Schedule Status" database.'
+        )
+
+    now = datetime.now(TZ)
+
+    # Resolve property names from the actual page returned by Notion.
+    # This keeps the scheduler tolerant of capitalization/spelling
+    # differences while still failing clearly if a required property is
+    # genuinely missing.
+    actual_property_names = set(
+        current_schedule_page.get("properties", {}).keys()
+    )
+
+    def resolve_status_property(expected_name):
+        if expected_name in actual_property_names:
+            return expected_name
+
+        def normalize(name):
+            return "".join(
+                character.lower()
+                for character in name
+                if character.isalnum()
+            )
+
+        expected_normalized = normalize(expected_name)
+
+        for actual_name in actual_property_names:
+            if normalize(actual_name) == expected_normalized:
+                return actual_name
+
+        for actual_name in actual_property_names:
+            actual_normalized = normalize(actual_name)
+            if actual_normalized.startswith(expected_normalized):
+                return actual_name
+
+        available = ", ".join(sorted(actual_property_names))
+        raise RuntimeError(
+            f'Could not find Schedule Status property "{expected_name}". '
+            f'Available properties are: {available}'
+        )
+
+    status_property = resolve_status_property("Status")
+    deadline_property = resolve_status_property("Near-Term Deadline Work")
+    pfs_property = resolve_status_property("PFS Weekly Target Remaining")
+    capacity_property = resolve_status_property("Schedule Capacity")
+    difference_property = resolve_status_property("Schedule difference")
+    updated_property = resolve_status_property("Last Updated")
+    reconsider_property = resolve_status_property("Reconsider")
+
+    reconsider_requested = checkbox_value(
+        current_schedule_page,
+        reconsider_property,
+    )
+
+    properties = {
+        status_property: {
+            "select": {"name": status_info["status"]}
+        },
+        deadline_property: {
+            "rich_text": [{
+                "type": "text",
+                "text": {
+                    "content": format_minutes(
+                        status_info["deadline_required"]
+                    )
+                },
+            }]
+        },
+        pfs_property: {
+            "rich_text": [{
+                "type": "text",
+                "text": {
+                    "content": (
+                        format_minutes(status_info["pfs_required"])
+                        if status_info["pfs_active"]
+                        else "Inactive"
+                    )
+                },
+            }]
+        },
+        capacity_property: {
+            "rich_text": [{
+                "type": "text",
+                "text": {
+                    "content": format_minutes(status_info["available"])
+                },
+            }]
+        },
+        difference_property: {
+            "rich_text": [{
+                "type": "text",
+                "text": {
+                    "content": (
+                        f"+{format_minutes(status_info['difference'])} surplus"
+                        if status_info["difference"] >= 0
+                        else f"-{format_minutes(abs(status_info['difference']))} needed"
+                    )
+                },
+            }]
+        },
+        updated_property: {
+            "date": {
+                "start": now.isoformat(),
+            }
+        },
+    }
+
+    notion(
+        "PATCH",
+        f"pages/{current_schedule_page['id']}",
+        json={"properties": properties},
+    )
+
+    if reconsider_requested:
+        print("Reconsider request detected on Current Schedule.")
+
+    print("Schedule Status updated in Notion.")
+    print(f"  Status: {status_info['status_detail']}")
+    print(
+        "  Schedule difference: "
+        f"{format_minutes(abs(status_info['difference']))} "
+        f"{'surplus' if status_info['difference'] >= 0 else 'needed'}"
+    )
+
+    return {
+        "status_info": status_info,
+        "page_id": current_schedule_page["id"],
+        "reconsider_requested": reconsider_requested,
+        "reconsider_property": reconsider_property,
+    }
+
+
+def clear_reconsider_request(page_id, property_name):
+    """Clear Reconsider only after a requested rebuild succeeds."""
+    notion(
+        "PATCH",
+        f"pages/{page_id}",
+        json={
+            "properties": {
+                property_name: {
+                    "checkbox": False,
+                }
+            }
+        },
+    )
+    print("Reconsider request completed; Reconsider reset to unchecked.")
+
+
+# ============================================================
+# REBUILD
+# ============================================================
+
+def delete_incomplete_allocations(allocations):
+    incomplete = [
+        allocation
+        for allocation in allocations
+        if not allocation["completed"]
+    ]
+
+    if not incomplete:
+        print("No incomplete allocations to remove.")
+        return
+
+    print(
+        f"Removing {len(incomplete)} incomplete "
+        "provisional allocations..."
+    )
+
+    for allocation in incomplete:
+        archive_page(allocation["page_id"])
+
+
+def rebuild(tasks, all_focus_blocks, focus_blocks, allocations):
+    print()
+    print("Rebuilding future schedule...")
+
+    master_tasks_by_id = {
+        task["page_id"]: task
+        for task in tasks
+    }
+
+    completed = calculate_completed_work(
+        allocations,
+        master_tasks_by_id,
+    )
+
+    # Validate the dependency graph before deleting provisional work.
+    build_dependency_graph(tasks)
+
+    # Completed PFS work is immutable history and counts toward the
+    # weekly target. The synthetic PFS weekly-hours task does not count.
+    completed_pfs_minutes = calculate_completed_pfs_minutes(
+        allocations,
+        master_tasks_by_id,
+    )
+
+    delete_incomplete_allocations(allocations)
+
+    pfs_task = next(
+        (
+            task for task in tasks
+            if task["task"] == PFS_TASK_NAME
+            and not task["completed"]
+        ),
+        None,
+    )
+
+    if pfs_task:
+        print("PFS weekly target: ACTIVE")
+        print(
+            "Completed PFS time this week: "
+            f"{format_minutes(completed_pfs_minutes)}"
+        )
+        print(
+            "PFS time still needed: "
+            f"{format_minutes(max(0, PFS_WEEKLY_TARGET_MINUTES - completed_pfs_minutes))}"
+        )
+    else:
+        print("PFS weekly target: INACTIVE")
+
+    # Calculate schedule sufficiency BEFORE scheduling consumes block capacity.
+    status_info = calculate_status(
+        tasks,
+        completed,
+        focus_blocks,
+        completed_pfs_minutes,
     )
 
     print()
-    print(
-        "----------------------------------------"
-    )
+    print("----------------------------------------")
+    print(status_info["status_detail"])
+    print("----------------------------------------")
 
-    print(
-        status_info["status_detail"]
-    )
-
-    print(
-        "----------------------------------------"
-    )
-
-    new_allocations, _ = schedule_tasks(
+    new_allocations, remaining = schedule_tasks(
         tasks,
         focus_blocks,
         completed,
         pfs_task,
         completed_pfs_minutes,
-        held_ids,
-    )
-
-    assign_schedule_order(
-        new_allocations,
-        datetime.now(TZ),
     )
 
     print(
-        f"New allocations to create: "
-        f"{len(new_allocations)}"
+        f"New allocations to create: {len(new_allocations)}"
     )
 
     for allocation in new_allocations:
-
         task = allocation["task"]
-
-        unit = (
-            "Hours"
-            if task["task"] == PFS_TASK_NAME
-            else task["unit"]
+        unit = "Hours" if task["task"] == PFS_TASK_NAME else task["unit"]
+        display_amount = format_allocation(
+            allocation["amount_minutes"],
+            unit,
         )
 
         print(
-            f'  {task["task"]} → '
-            f'{format_allocation(
-                allocation["amount_minutes"],
-                unit
-            )}'
+            f'  {task["task"]} → {display_amount}'
         )
 
-        create_allocation(
-            allocation
-        )
+        create_allocation(allocation)
 
-    # Read the database again so the newly
-    # created allocations are included when
-    # deciding which allocation is final.
-    refreshed_allocations = (
-        read_allocations()
-    )
-
-    update_final_labels(
-        refreshed_allocations,
-        tasks_by_id,
-        all_focus_blocks,
-    )
+    print()
 
     return {
-        "completed_pfs_minutes":
-            completed_pfs_minutes,
-        "new_allocations":
-            len(new_allocations),
+        "completed_pfs_minutes": completed_pfs_minutes,
+        "new_allocations": len(new_allocations),
     }
 
 
@@ -3225,171 +1709,75 @@ def rebuild(
 # ============================================================
 
 def main():
-    print(
-        "========================================"
-    )
-
-    print(
-        "          NOTION SCHEDULER"
-    )
-
-    print(
-        "========================================"
-    )
-
+    print("========================================")
+    print("          NOTION SCHEDULER")
+    print("========================================")
     print()
 
-    tasks = read_tasks()
-
-    all_focus_blocks, focus_blocks = (
-        read_focus_time()
-    )
-
+    tasks = read_master_tasks()
+    all_focus_blocks, focus_blocks = read_focus_time()
     allocations = read_allocations()
 
-    print(
-        f"Focus Time blocks found: "
-        f"{len(focus_blocks)}"
-    )
+    print(f"Master tasks found: {len(tasks)}")
+    print(f"Focus Time blocks found: {len(focus_blocks)}")
+    print(f"Task Allocations found: {len(allocations)}")
 
-    print(
-        f"Task Allocations found: "
-        f"{len(allocations)}"
-    )
-
-    tasks_by_id = {
-        task["page_id"]: task
-        for task in tasks
-    }
-
-    completed = (
-        calculate_completed_work(
-            allocations,
-            tasks_by_id,
-        )
-    )
-
-    completed_pfs_minutes = (
-        calculate_completed_pfs_minutes(
-            allocations,
-            tasks_by_id,
-            all_focus_blocks,
-        )
-    )
-
-    held_ids = held_task_ids(
-        allocations,
-        tasks_by_id,
-    )
-
-    update_overdue_flags(
+    # The Schedule Status page is a separate Notion database from the
+    # Daily Plan. Update it every run so the displayed capacity stays
+    # current even when no schedule rebuild is needed. The page also
+    # contains the explicit Reconsider control.
+    schedule_status = update_schedule_status(
         tasks,
         allocations,
-        completed,
+        focus_blocks,
     )
-
-    schedule_status = (
-        update_schedule_status(
-            tasks,
-            allocations,
-            focus_blocks,
-            completed,
-            completed_pfs_minutes,
-            held_ids,
-        )
-    )
+    reconsider_requested = schedule_status["reconsider_requested"]
 
     state = load_state()
 
+    focus_fingerprint = build_focus_fingerprint(all_focus_blocks)
+    master_fingerprint = build_master_fingerprint(tasks)
+    completed_allocation_fingerprint = (
+        build_completed_allocation_fingerprint(allocations)
+    )
+
     current_inputs = {
-        "focus":
-            build_focus_fingerprint(
-                all_focus_blocks
-            ),
-
-        "tasks":
-            build_task_fingerprint(
-                tasks
-            ),
-
-        "allocations":
-            build_allocation_fingerprint(
-                allocations,
-                tasks_by_id,
-            ),
+        "focus": focus_fingerprint,
+        "master": master_fingerprint,
+        "completed_allocations": completed_allocation_fingerprint,
     }
 
     force_rebuild = (
-        os.environ
-        .get(
-            "FORCE_REBUILD",
-            "",
-        )
-        .lower()
-        == "true"
+        os.environ.get("FORCE_REBUILD", "").lower() == "true"
     )
-
-    previous_inputs = {
-        "focus":
-            state.get("focus"),
-
-        "tasks":
-            state.get("tasks"),
-
-        "allocations":
-            state.get("allocations"),
-    }
 
     changed = (
-        current_inputs
-        != previous_inputs
+        current_inputs != {
+            "focus": state.get("focus"),
+            "master": state.get("master"),
+            "completed_allocations": state.get("completed_allocations"),
+        }
     )
 
-    reconsider_requested = (
-        schedule_status[
-            "reconsider_requested"
-        ]
-    )
-
-    if (
-        not force_rebuild
-        and not changed
-        and not reconsider_requested
-    ):
-        print(
-            "No relevant changes detected."
-        )
-
-        print(
-            "Scheduler finished without "
-            "rebuilding the schedule."
-        )
-
+    if not force_rebuild and not changed and not reconsider_requested:
+        print("No relevant changes detected.")
+        print("Scheduler finished without changing the Daily Plan.")
         return
 
     if reconsider_requested:
-
-        print(
-            "Reconsider request detected."
-        )
-
+        print("Explicit Reconsider request: rebuilding now.")
     elif force_rebuild:
-
-        print(
-            "Forced rebuild requested."
-        )
-
+        print("Forced rebuild requested.")
     else:
+        print("Relevant scheduling changes detected.")
 
-        print(
-            "Relevant scheduling changes "
-            "detected."
-        )
-
-    # There is intentionally no active-Focus-Time
-    # protection here. If the inputs change,
-    # the scheduler rebuilds the remaining
-    # schedule immediately.
+    # Normal automatic rebuilds do not churn the active Focus Time block.
+    # An explicit Reconsider request is different: it intentionally
+    # overrides that protection. read_focus_time() has already clipped an
+    # active block's start to NOW, so the rebuild sees only the remaining
+    # future portion of the current block.
+    if not reconsider_requested and should_defer_rebuild(all_focus_blocks):
+        return
 
     rebuild(
         tasks,
@@ -3398,23 +1786,18 @@ def main():
         allocations,
     )
 
-    save_state(
-        current_inputs
-    )
+    save_state(current_inputs)
 
+    # Only clear the button's request after the entire rebuild and state
+    # save have succeeded. If anything fails, the checkbox remains checked
+    # so the request is not silently lost.
     if reconsider_requested:
-
         clear_reconsider_request(
             schedule_status["page_id"],
-            schedule_status[
-                "reconsider_property"
-            ],
+            schedule_status["reconsider_property"],
         )
 
-    print()
-    print(
-        "Scheduler finished successfully."
-    )
+    print("Scheduler finished successfully.")
 
 
 if __name__ == "__main__":
