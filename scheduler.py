@@ -29,6 +29,12 @@ PFS_WEEKLY_TARGET_MINUTES = 30 * 60
 
 CREATE_REQUEST_DELAY = 0.5
 MAX_RATE_LIMIT_RETRIES = 5
+MAX_TRANSIENT_RETRIES = 5
+NOTION_REQUEST_TIMEOUT_SECONDS = 30
+TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+DATABASE_ID_CACHE = {}
+DATA_SOURCE_ID_CACHE = {}
 
 STATE_FILE = os.environ.get(
     "SCHEDULER_STATE_FILE",
@@ -144,60 +150,96 @@ HEADERS = {
 def notion(method, path, **kwargs):
     url = f"https://api.notion.com/v1/{path}"
 
-    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+    # Never allow a single Notion request to hang indefinitely. GitHub
+    # Actions can otherwise sit on a stalled Cloudflare/Notion request
+    # until the job itself times out.
+    kwargs.setdefault("timeout", NOTION_REQUEST_TIMEOUT_SECONDS)
 
-        response = requests.request(
-            method,
-            url,
-            headers=HEADERS,
-            **kwargs,
-        )
+    transient_attempt = 0
+
+    while True:
+        try:
+            response = requests.request(
+                method,
+                url,
+                headers=HEADERS,
+                **kwargs,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if transient_attempt >= MAX_TRANSIENT_RETRIES:
+                raise RuntimeError(
+                    f"Notion request failed after {MAX_TRANSIENT_RETRIES} retries "
+                    f"({method} {path}): {exc}"
+                ) from exc
+
+            delay = min(60, 2 ** transient_attempt)
+            transient_attempt += 1
+            print(
+                f"Transient Notion connection error on {method} {path}. "
+                f"Retrying in {delay}s (attempt {transient_attempt}/{MAX_TRANSIENT_RETRIES})..."
+            )
+            time.sleep(delay)
+            continue
 
         if response.ok:
             if not response.content:
                 return {}
-
             return response.json()
 
-        if response.status_code == 429:
+        if response.status_code in TRANSIENT_STATUS_CODES:
+            if response.status_code == 429:
+                retry_after = 3
+                try:
+                    retry_after_header = response.headers.get("Retry-After")
+                    if retry_after_header:
+                        retry_after = float(retry_after_header)
+                    else:
+                        data = response.json()
+                        retry_after = float(
+                            data.get("error", {})
+                            .get("additional_data", {})
+                            .get("retry_after", 3)
+                        )
+                except Exception:
+                    pass
 
-            retry_after = 3
+                if transient_attempt >= MAX_RATE_LIMIT_RETRIES:
+                    raise RuntimeError(
+                        "Notion rate limit persisted after "
+                        f"{MAX_RATE_LIMIT_RETRIES} retries: {response.text}"
+                    )
 
-            try:
-                data = response.json()
-
-                retry_after = int(
-                    data.get("error", {})
-                    .get("additional_data", {})
-                    .get("retry_after", 3)
+                transient_attempt += 1
+                delay = max(1, retry_after)
+                print(
+                    f"Notion rate limit reached on {method} {path}. "
+                    f"Waiting {delay:g}s (attempt {transient_attempt}/{MAX_RATE_LIMIT_RETRIES})..."
                 )
+                time.sleep(delay)
+                continue
 
-            except Exception:
-                pass
-
-            if attempt >= MAX_RATE_LIMIT_RETRIES:
+            if transient_attempt >= MAX_TRANSIENT_RETRIES:
                 raise RuntimeError(
-                    "Notion rate limit persisted after "
-                    f"{MAX_RATE_LIMIT_RETRIES} retries: "
-                    f"{response.text}"
+                    f"Transient Notion API error persisted after "
+                    f"{MAX_TRANSIENT_RETRIES} retries "
+                    f"({method} {path}): "
+                    f"HTTP {response.status_code}: {response.text}"
                 )
 
+            delay = min(60, 2 ** transient_attempt)
+            transient_attempt += 1
             print(
-                "Notion rate limit reached. "
-                f"Waiting {retry_after} seconds..."
+                f"Transient Notion API error on {method} {path}: "
+                f"HTTP {response.status_code}. "
+                f"Retrying in {delay}s (attempt {transient_attempt}/{MAX_TRANSIENT_RETRIES})..."
             )
-
-            time.sleep(max(1, retry_after))
+            time.sleep(delay)
             continue
 
         raise RuntimeError(
             f"Notion API error "
             f"{response.status_code}: {response.text}"
         )
-
-    raise RuntimeError(
-        "Notion API request failed."
-    )
 
 
 def search_all(query):
@@ -231,6 +273,10 @@ def search_all(query):
 
 
 def find_database(name):
+    cached = DATABASE_ID_CACHE.get(name)
+    if cached:
+        return cached
+
     for obj in search_all(name):
 
         if obj.get("object") == "database":
@@ -241,7 +287,17 @@ def find_database(name):
             ).strip()
 
             if title == name:
-                return obj["id"]
+                database_id = obj["id"]
+                DATABASE_ID_CACHE[name] = database_id
+
+                # Newer Notion database responses may already include the
+                # data source information. Cache it when available so we
+                # do not make an unnecessary follow-up GET request.
+                sources = obj.get("data_sources", [])
+                if sources:
+                    DATA_SOURCE_ID_CACHE[database_id] = sources[0]["id"]
+
+                return database_id
 
         elif obj.get("object") == "data_source":
 
@@ -264,6 +320,8 @@ def find_database(name):
             ).strip()
 
             if title == name:
+                DATABASE_ID_CACHE[name] = database_id
+                DATA_SOURCE_ID_CACHE[database_id] = obj["id"]
                 return database_id
 
     raise RuntimeError(
@@ -272,6 +330,10 @@ def find_database(name):
 
 
 def get_data_source(database_id):
+    cached = DATA_SOURCE_ID_CACHE.get(database_id)
+    if cached:
+        return cached
+
     data = notion(
         "GET",
         f"databases/{database_id}",
@@ -285,7 +347,9 @@ def get_data_source(database_id):
             f"{database_id}."
         )
 
-    return sources[0]["id"]
+    data_source_id = sources[0]["id"]
+    DATA_SOURCE_ID_CACHE[database_id] = data_source_id
+    return data_source_id
 
 
 def query_data_source(data_source_id):
