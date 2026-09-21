@@ -3287,6 +3287,32 @@ def rebuild(
         f"{len(new_allocations)}"
     )
 
+    if not new_allocations:
+        active_tasks = [
+            task for task in tasks
+            if (
+                not task["completed"]
+                and task["task"] != PFS_TASK_NAME
+                and task.get("minutes", 0) > 0
+            )
+        ]
+        print(
+            "Scheduler diagnostic: "
+            f"{len(active_tasks)} active non-PFS tasks with workload; "
+            f"{len(focus_blocks)} Focus Time blocks available; "
+            f"{len(held_ids)} tasks currently held."
+        )
+        if active_tasks and focus_blocks:
+            print(
+                "No allocation was produced. This means every active task "
+                "was rejected by eligibility/dependency/deadline rules; "
+                "the run will NOT be recorded as a completed scheduling state."
+            )
+            raise RuntimeError(
+                "Scheduler produced zero Task Allocations despite having "
+                "active workload and Focus Time. See the diagnostic above."
+            )
+
     for allocation in new_allocations:
 
         task = allocation["task"]
@@ -3327,6 +3353,8 @@ def rebuild(
             completed_pfs_minutes,
         "new_allocations":
             len(new_allocations),
+        "allocations":
+            refreshed_allocations,
     }
 
 
@@ -3455,6 +3483,31 @@ def main():
         != previous_inputs
     )
 
+    # An empty Task Allocations database is never a valid steady state when
+    # there is schedulable work and Focus Time available.  In particular, do
+    # not let a previously saved state fingerprint suppress the initial
+    # population of Task Allocations.
+    remaining_schedulable_work = any(
+        (
+            not task["completed"]
+            and task["task"] != PFS_TASK_NAME
+            and task.get("minutes", 0) > 0
+        )
+        for task in tasks
+    )
+    needs_initial_allocation_build = (
+        not allocations
+        and bool(focus_blocks)
+        and remaining_schedulable_work
+    )
+
+    if needs_initial_allocation_build:
+        changed = True
+        print(
+            "Task Allocations is empty while schedulable work and Focus Time "
+            "exist; forcing an initial rebuild."
+        )
+
     reconsider_requested = (
         schedule_status[
             "reconsider_requested"
@@ -3511,15 +3564,35 @@ def main():
     ):
         return
 
-    rebuild(
+    rebuild_result = rebuild(
         tasks,
         all_focus_blocks,
         focus_blocks,
         allocations,
     )
 
+    # Save the fingerprint of the ACTUAL post-rebuild Task Allocations state,
+    # not the empty/pre-rebuild snapshot.  Otherwise every successful rebuild
+    # looks changed on the next run and the scheduler can churn indefinitely.
+    refreshed_allocations = rebuild_result["allocations"]
+    refreshed_inputs = {
+        "focus":
+            build_focus_fingerprint(
+                all_focus_blocks
+            ),
+        "tasks":
+            build_task_fingerprint(
+                tasks
+            ),
+        "allocations":
+            build_allocation_fingerprint(
+                refreshed_allocations,
+                tasks_by_id,
+            ),
+    }
+
     save_state(
-        current_inputs
+        refreshed_inputs
     )
 
     if reconsider_requested:
