@@ -474,8 +474,6 @@ def read_tasks():
             data_source_id
         )
 
-        dependency_found = False
-
         for page in pages:
 
             name = title_value(
@@ -490,13 +488,6 @@ def read_tasks():
                 page.get("properties", {})
                 .get(DEPENDENCY_PROPERTY_NAME)
             )
-
-            if (
-                dependency_property
-                and dependency_property.get("type")
-                == "relation"
-            ):
-                dependency_found = True
 
             workload = number_value(
                 page,
@@ -540,12 +531,6 @@ def read_tasks():
                     unit,
                 ),
             })
-
-        if not dependency_found:
-            raise RuntimeError(
-                f'"{database_name}" does not have '
-                f'a "{DEPENDENCY_PROPERTY_NAME}" relation.'
-            )
 
     print(
         f"Source tasks found: {len(tasks)}"
