@@ -35,6 +35,7 @@ TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 DATABASE_ID_CACHE = {}
 DATA_SOURCE_ID_CACHE = {}
+DATABASE_PROPERTY_CACHE = {}
 
 STATE_FILE = os.environ.get(
     "SCHEDULER_STATE_FILE",
@@ -350,6 +351,39 @@ def get_data_source(database_id):
     data_source_id = sources[0]["id"]
     DATA_SOURCE_ID_CACHE[database_id] = data_source_id
     return data_source_id
+
+
+def get_database_properties(database_id):
+    """Return the current Notion database property schema, cached per run."""
+    cached = DATABASE_PROPERTY_CACHE.get(database_id)
+    if cached is not None:
+        return cached
+
+    data = notion(
+        "GET",
+        f"databases/{database_id}",
+    )
+
+    properties = data.get("properties", {})
+    DATABASE_PROPERTY_CACHE[database_id] = properties
+    return properties
+
+
+def first_checkbox_property_name(properties, preferred_names):
+    """Find a completion checkbox without mistaking Hold/Overdue for it."""
+    for name in preferred_names:
+        prop = properties.get(name)
+        if prop and prop.get("type") == "checkbox":
+            return name
+    return None
+
+
+def allocation_completion_property_name(database_id):
+    properties = get_database_properties(database_id)
+    return first_checkbox_property_name(
+        properties,
+        ["Completion", "Completed", "Complete", "Done"],
+    )
 
 
 def query_data_source(data_source_id):
@@ -712,6 +746,7 @@ def read_allocations():
     )
 
     allocations = []
+    completion_property = allocation_completion_property_name(database_id)
 
     for page in pages:
 
@@ -751,9 +786,10 @@ def read_allocations():
                 page,
                 "Unit",
             ),
-            "completed": checkbox_value(
-                page,
-                "Completion",
+            "completed": (
+                checkbox_value(page, completion_property)
+                if completion_property
+                else False
             ),
             "overdue": checkbox_value(
                 page,
@@ -2083,10 +2119,6 @@ def create_allocation(
             }
         },
 
-        "Completion": {
-            "checkbox": False
-        },
-
         relation_name: {
             "relation": [
                 {
@@ -2095,6 +2127,17 @@ def create_allocation(
             ]
         },
     }
+
+    completion_property = allocation_completion_property_name(database_id)
+    if completion_property:
+        properties[completion_property] = {
+            "checkbox": False
+        }
+    else:
+        print(
+            'Warning: Task Allocations has no checkbox property for completion; '
+            'new allocations will be created without a completion field.'
+        )
 
     result = notion(
         "POST",
@@ -3115,47 +3158,6 @@ def save_state(state):
 
 
 # ============================================================
-# ACTIVE FOCUS TIME SAFETY
-# ============================================================
-
-def active_focus_block(
-    all_focus_blocks,
-    now,
-):
-    for block in all_focus_blocks:
-        if (
-            block["start"] <= now
-            < block["end"]
-        ):
-            return block
-
-    return None
-
-
-def should_defer_rebuild(
-    all_focus_blocks,
-):
-    now = datetime.now(TZ)
-    block = active_focus_block(
-        all_focus_blocks,
-        now,
-    )
-
-    if block:
-        print(
-            "A Focus Time block is currently active "
-            f"({block['start'].strftime('%I:%M %p').lstrip('0')}–"
-            f"{block['end'].strftime('%I:%M %p').lstrip('0')})."
-        )
-        print(
-            "Rebuild deferred until that block has ended."
-        )
-        return True
-
-    return False
-
-
-# ============================================================
 # REBUILD
 # ============================================================
 
@@ -3548,22 +3550,6 @@ def main():
             "Relevant scheduling changes "
             "detected."
         )
-
-    # Do not defer the INITIAL population of Task Allocations.  An empty
-    # Task Allocations database is not a valid scheduled state, even if the
-    # workflow happens to run while a Focus Time block is active.
-    #
-    # For an already-populated schedule, however, automatic rebuilds should
-    # still avoid churning an active Focus Time block. Explicit Reconsider
-    # requests continue to bypass that protection.
-    if (
-        not needs_initial_allocation_build
-        and not reconsider_requested
-        and should_defer_rebuild(
-            all_focus_blocks
-        )
-    ):
-        return
 
     rebuild_result = rebuild(
         tasks,
