@@ -2160,13 +2160,13 @@ def assign_schedule_order(
 # CREATE ALLOCATION
 # ============================================================
 
-def get_allocation_completion_property():
+def get_allocation_completion_property(database_id):
     """
     Return the actual completion checkbox property name on Task Allocations.
     """
     schema = notion(
         "GET",
-        f"databases/{TASK_ALLOCATIONS_DB_ID}",
+        f"databases/{database_id}",
     )
 
     properties = schema.get("properties", {})
@@ -2281,7 +2281,7 @@ def create_allocation(
     # Resolve the live schema instead of assuming the property is named
     # "Completion". This prevents a Notion 400 when that property does not
     # exist.
-    completion_property = allocation_completion_property_name(
+    completion_property = get_allocation_completion_property(
         database_id
     )
 
