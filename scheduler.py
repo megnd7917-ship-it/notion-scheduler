@@ -29,13 +29,6 @@ PFS_WEEKLY_TARGET_MINUTES = 30 * 60
 
 CREATE_REQUEST_DELAY = 0.5
 MAX_RATE_LIMIT_RETRIES = 5
-MAX_TRANSIENT_RETRIES = 5
-NOTION_REQUEST_TIMEOUT_SECONDS = 30
-TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-
-DATABASE_ID_CACHE = {}
-DATA_SOURCE_ID_CACHE = {}
-DATABASE_PROPERTY_CACHE = {}
 
 STATE_FILE = os.environ.get(
     "SCHEDULER_STATE_FILE",
@@ -47,10 +40,11 @@ STATE_FILE = os.environ.get(
 # SOURCE DATABASES
 # ============================================================
 
-# Each source database has one corresponding relation
+# Each source database has one corresponding one-page relation
 # in Task Allocations.
 #
 # The scheduler reads tasks directly from these databases.
+# There is no Master To-Do List.
 
 SOURCE_DATABASES = {
     "JST To-Do": "JST Task",
@@ -151,96 +145,60 @@ HEADERS = {
 def notion(method, path, **kwargs):
     url = f"https://api.notion.com/v1/{path}"
 
-    # Never allow a single Notion request to hang indefinitely. GitHub
-    # Actions can otherwise sit on a stalled Cloudflare/Notion request
-    # until the job itself times out.
-    kwargs.setdefault("timeout", NOTION_REQUEST_TIMEOUT_SECONDS)
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
 
-    transient_attempt = 0
-
-    while True:
-        try:
-            response = requests.request(
-                method,
-                url,
-                headers=HEADERS,
-                **kwargs,
-            )
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-            if transient_attempt >= MAX_TRANSIENT_RETRIES:
-                raise RuntimeError(
-                    f"Notion request failed after {MAX_TRANSIENT_RETRIES} retries "
-                    f"({method} {path}): {exc}"
-                ) from exc
-
-            delay = min(60, 2 ** transient_attempt)
-            transient_attempt += 1
-            print(
-                f"Transient Notion connection error on {method} {path}. "
-                f"Retrying in {delay}s (attempt {transient_attempt}/{MAX_TRANSIENT_RETRIES})..."
-            )
-            time.sleep(delay)
-            continue
+        response = requests.request(
+            method,
+            url,
+            headers=HEADERS,
+            **kwargs,
+        )
 
         if response.ok:
             if not response.content:
                 return {}
+
             return response.json()
 
-        if response.status_code in TRANSIENT_STATUS_CODES:
-            if response.status_code == 429:
-                retry_after = 3
-                try:
-                    retry_after_header = response.headers.get("Retry-After")
-                    if retry_after_header:
-                        retry_after = float(retry_after_header)
-                    else:
-                        data = response.json()
-                        retry_after = float(
-                            data.get("error", {})
-                            .get("additional_data", {})
-                            .get("retry_after", 3)
-                        )
-                except Exception:
-                    pass
+        if response.status_code == 429:
 
-                if transient_attempt >= MAX_RATE_LIMIT_RETRIES:
-                    raise RuntimeError(
-                        "Notion rate limit persisted after "
-                        f"{MAX_RATE_LIMIT_RETRIES} retries: {response.text}"
-                    )
+            retry_after = 3
 
-                transient_attempt += 1
-                delay = max(1, retry_after)
-                print(
-                    f"Notion rate limit reached on {method} {path}. "
-                    f"Waiting {delay:g}s (attempt {transient_attempt}/{MAX_RATE_LIMIT_RETRIES})..."
+            try:
+                data = response.json()
+
+                retry_after = int(
+                    data.get("error", {})
+                    .get("additional_data", {})
+                    .get("retry_after", 3)
                 )
-                time.sleep(delay)
-                continue
 
-            if transient_attempt >= MAX_TRANSIENT_RETRIES:
+            except Exception:
+                pass
+
+            if attempt >= MAX_RATE_LIMIT_RETRIES:
                 raise RuntimeError(
-                    f"Transient Notion API error persisted after "
-                    f"{MAX_TRANSIENT_RETRIES} retries "
-                    f"({method} {path}): "
-                    f"HTTP {response.status_code}: {response.text}"
+                    "Notion rate limit persisted after "
+                    f"{MAX_RATE_LIMIT_RETRIES} retries: "
+                    f"{response.text}"
                 )
 
-            delay = min(60, 2 ** transient_attempt)
-            transient_attempt += 1
             print(
-                f"Transient Notion API error on {method} {path}: "
-                f"HTTP {response.status_code}. "
-                f"Retrying in {delay}s (attempt {transient_attempt}/{MAX_TRANSIENT_RETRIES})..."
+                "Notion rate limit reached. "
+                f"Waiting {retry_after} seconds..."
             )
-            time.sleep(delay)
+
+            time.sleep(max(1, retry_after))
             continue
 
         raise RuntimeError(
             f"Notion API error "
             f"{response.status_code}: {response.text}"
         )
+
+    raise RuntimeError(
+        "Notion API request failed."
+    )
 
 
 def search_all(query):
@@ -274,10 +232,6 @@ def search_all(query):
 
 
 def find_database(name):
-    cached = DATABASE_ID_CACHE.get(name)
-    if cached:
-        return cached
-
     for obj in search_all(name):
 
         if obj.get("object") == "database":
@@ -288,17 +242,7 @@ def find_database(name):
             ).strip()
 
             if title == name:
-                database_id = obj["id"]
-                DATABASE_ID_CACHE[name] = database_id
-
-                # Newer Notion database responses may already include the
-                # data source information. Cache it when available so we
-                # do not make an unnecessary follow-up GET request.
-                sources = obj.get("data_sources", [])
-                if sources:
-                    DATA_SOURCE_ID_CACHE[database_id] = sources[0]["id"]
-
-                return database_id
+                return obj["id"]
 
         elif obj.get("object") == "data_source":
 
@@ -321,8 +265,6 @@ def find_database(name):
             ).strip()
 
             if title == name:
-                DATABASE_ID_CACHE[name] = database_id
-                DATA_SOURCE_ID_CACHE[database_id] = obj["id"]
                 return database_id
 
     raise RuntimeError(
@@ -331,10 +273,6 @@ def find_database(name):
 
 
 def get_data_source(database_id):
-    cached = DATA_SOURCE_ID_CACHE.get(database_id)
-    if cached:
-        return cached
-
     data = notion(
         "GET",
         f"databases/{database_id}",
@@ -348,42 +286,7 @@ def get_data_source(database_id):
             f"{database_id}."
         )
 
-    data_source_id = sources[0]["id"]
-    DATA_SOURCE_ID_CACHE[database_id] = data_source_id
-    return data_source_id
-
-
-def get_database_properties(database_id):
-    """Return the current Notion database property schema, cached per run."""
-    cached = DATABASE_PROPERTY_CACHE.get(database_id)
-    if cached is not None:
-        return cached
-
-    data = notion(
-        "GET",
-        f"databases/{database_id}",
-    )
-
-    properties = data.get("properties", {})
-    DATABASE_PROPERTY_CACHE[database_id] = properties
-    return properties
-
-
-def first_checkbox_property_name(properties, preferred_names):
-    """Find a completion checkbox without mistaking Hold/Overdue for it."""
-    for name in preferred_names:
-        prop = properties.get(name)
-        if prop and prop.get("type") == "checkbox":
-            return name
-    return None
-
-
-def allocation_completion_property_name(database_id):
-    properties = get_database_properties(database_id)
-    return first_checkbox_property_name(
-        properties,
-        ["Completion", "Completed", "Complete", "Done"],
-    )
+    return sources[0]["id"]
 
 
 def query_data_source(data_source_id):
@@ -746,7 +649,6 @@ def read_allocations():
     )
 
     allocations = []
-    completion_property = allocation_completion_property_name(database_id)
 
     for page in pages:
 
@@ -786,10 +688,9 @@ def read_allocations():
                 page,
                 "Unit",
             ),
-            "completed": (
-                checkbox_value(page, completion_property)
-                if completion_property
-                else False
+            "completed": checkbox_value(
+                page,
+                "Completion",
             ),
             "overdue": checkbox_value(
                 page,
@@ -895,6 +796,64 @@ def calculate_completed_work(
     return completed
 
 
+def sync_completed_source_tasks(
+    tasks,
+    completed,
+):
+    """Mark source tasks complete when their allocated work is complete.
+
+    Task Allocations represent individual work segments. The source task
+    remains the authoritative record of overall completion. A source task
+    is marked Completed only when completed allocation time reaches its
+    original workload.
+    """
+    changed = 0
+
+    for task in tasks:
+        if task["completed"]:
+            continue
+
+        total_minutes = task["minutes"]
+
+        if total_minutes <= 0:
+            continue
+
+        completed_minutes = completed.get(
+            task["page_id"],
+            0,
+        )
+
+        if completed_minutes < total_minutes:
+            continue
+
+        print(
+            f'Marking source task completed: "{task["task"]}"'
+        )
+
+        notion(
+            "PATCH",
+            f'pages/{task["page_id"]}',
+            json={
+                "properties": {
+                    "Completed": {
+                        "checkbox": True
+                    }
+                }
+            },
+        )
+
+        task["completed"] = True
+        changed += 1
+
+    if changed:
+        print(
+            f"Synchronized completion for "
+            f"{changed} source task(s)."
+        )
+
+    return changed
+
+
 # ============================================================
 # HOLD
 # ============================================================
@@ -903,10 +862,21 @@ def held_task_ids(
     allocations,
     tasks_by_id,
 ):
-    held = set()
+    """Return the effective held-task set.
+
+    A task is explicitly held when it has an unfinished Task Allocation
+    with Hold checked. Any unfinished task that is downstream of a held
+    task (via the authoritative Blocked by relation) is also treated as
+    held. This propagation is transitive and is recalculated on every run.
+
+    We do NOT write Hold back to downstream source tasks. Their effective
+    hold is derived from the dependency graph, so releasing the upstream
+    hold automatically makes them schedulable again unless another hold
+    or dependency still prevents them.
+    """
+    explicitly_held = set()
 
     for allocation in allocations:
-
         if allocation["completed"]:
             continue
 
@@ -918,10 +888,77 @@ def held_task_ids(
             tasks_by_id,
         )
 
-        if task_id:
-            held.add(task_id)
+        if not task_id:
+            continue
 
-    return held
+        task = tasks_by_id.get(task_id)
+
+        if task and task["completed"]:
+            continue
+
+        explicitly_held.add(task_id)
+
+    if not explicitly_held:
+        return set()
+
+    _, dependents = build_dependency_graph(
+        list(tasks_by_id.values())
+    )
+
+    effective_held = set(explicitly_held)
+    queue = list(explicitly_held)
+
+    while queue:
+        held_id = queue.pop(0)
+
+        for dependent_id in dependents.get(
+            held_id,
+            set(),
+        ):
+            dependent = tasks_by_id.get(
+                dependent_id
+            )
+
+            if not dependent:
+                continue
+
+            if dependent["completed"]:
+                continue
+
+            if dependent_id in effective_held:
+                continue
+
+            effective_held.add(
+                dependent_id
+            )
+            queue.append(
+                dependent_id
+            )
+
+    derived = (
+        effective_held
+        - explicitly_held
+    )
+
+    if explicitly_held:
+        print(
+            f"Explicitly held tasks: "
+            f"{len(explicitly_held)}"
+        )
+
+    if derived:
+        print(
+            f"Tasks held by dependency on a held "
+            f"task: {len(derived)}"
+        )
+
+        for task_id in sorted(derived):
+            print(
+                f'  Derived Hold: "'
+                f'{tasks_by_id[task_id]["task"]}"'
+            )
+
+    return effective_held
 
 
 # ============================================================
@@ -1036,14 +1073,9 @@ def build_dependency_graph(tasks):
             )
 
             if dependency_id == task["page_id"]:
-                # A task should never block itself.  A self-link can be
-                # created accidentally in Notion, and treating it as a
-                # fatal dependency would prevent the entire scheduler from
-                # running.  Ignore the malformed self-link while preserving
-                # all genuine Blocked by relationships.
                 print(
                     f'Warning: self-dependency on "{task["task"]}" '
-                    "was ignored."
+                    f'was ignored.'
                 )
                 continue
 
@@ -1285,10 +1317,12 @@ def dependency_blocked(
         if dependency["completed"]:
             continue
 
-        # A held prerequisite is temporarily
-        # ignored so the dependent can proceed.
+        # A held prerequisite makes the dependent task
+        # unavailable as well. The effective held set also
+        # contains transitive downstream tasks, but keeping
+        # this check here makes the dependency rule explicit.
         if dependency_id in held_ids:
-            continue
+            return True
 
         if (
             completed.get(
@@ -2119,6 +2153,10 @@ def create_allocation(
             }
         },
 
+        "Completion": {
+            "checkbox": False
+        },
+
         relation_name: {
             "relation": [
                 {
@@ -2127,17 +2165,6 @@ def create_allocation(
             ]
         },
     }
-
-    completion_property = allocation_completion_property_name(database_id)
-    if completion_property:
-        properties[completion_property] = {
-            "checkbox": False
-        }
-    else:
-        print(
-            'Warning: Task Allocations has no checkbox property for completion; '
-            'new allocations will be created without a completion field.'
-        )
 
     result = notion(
         "POST",
@@ -2425,6 +2452,7 @@ def calculate_status(
     completed_pfs_minutes,
     held_ids,
 ):
+    """Calculate schedule status and expose the source of any shortfall."""
     now = datetime.now(TZ)
 
     horizon = (
@@ -2440,8 +2468,27 @@ def calculate_status(
     remaining = {}
 
     total_remaining = 0
+    held_minutes = 0
+    completed_minutes_total = 0
+    undated_minutes = 0
 
     for task in tasks:
+        original_minutes = task["minutes"]
+        completed_minutes = min(
+            original_minutes,
+            completed.get(
+                task["page_id"],
+                0,
+            ),
+        )
+
+        completed_minutes_total += completed_minutes
+
+        rem = max(
+            0,
+            original_minutes
+            - completed_minutes,
+        )
 
         if task["completed"]:
             continue
@@ -2450,24 +2497,17 @@ def calculate_status(
             continue
 
         if task["page_id"] in held_ids:
+            held_minutes += rem
             continue
 
-        rem = max(
-            0,
-            task["minutes"]
-            - completed.get(
-                task["page_id"],
-                0,
-            ),
-        )
+        if rem <= 0:
+            continue
 
-        if rem > 0:
+        remaining[task["page_id"]] = rem
+        total_remaining += rem
 
-            remaining[
-                task["page_id"]
-            ] = rem
-
-            total_remaining += rem
+        if task.get("deadline") is None:
+            undated_minutes += rem
 
     tasks_by_id, dependents = (
         build_dependency_graph(tasks)
@@ -2476,7 +2516,6 @@ def calculate_status(
     required_by = {}
 
     for task in tasks:
-
         if task["completed"]:
             continue
 
@@ -2489,19 +2528,14 @@ def calculate_status(
         if task["priority"] == "Low":
             continue
 
-        deadline = actual_deadline_end(
-            task
-        )
+        deadline = actual_deadline_end(task)
 
         if deadline is not None:
-            required_by[
-                task["page_id"]
-            ] = deadline
+            required_by[task["page_id"]] = deadline
 
     visiting = set()
 
     def solve_required_by(task_id):
-
         if task_id in visiting:
             raise RuntimeError(
                 "Circular dependency detected "
@@ -2514,18 +2548,12 @@ def calculate_status(
             task_id,
             [],
         ):
-
             if dependent_id in held_ids:
                 continue
 
-            solve_required_by(
-                dependent_id
-            )
+            solve_required_by(dependent_id)
 
-            dependent = tasks_by_id[
-                dependent_id
-            ]
-
+            dependent = tasks_by_id[dependent_id]
             dependent_remaining = remaining.get(
                 dependent_id,
                 0,
@@ -2552,31 +2580,22 @@ def calculate_status(
                 - timedelta(days=1)
             )
 
-            own = required_by.get(
-                task_id
-            )
+            own = required_by.get(task_id)
 
             if (
                 own is None
                 or candidate < own
             ):
-                required_by[
-                    task_id
-                ] = candidate
+                required_by[task_id] = candidate
 
         visiting.remove(task_id)
 
     for task in tasks:
-        solve_required_by(
-            task["page_id"]
-        )
+        solve_required_by(task["page_id"])
 
     deadline_tasks = []
 
-    for task_id, deadline in (
-        required_by.items()
-    ):
-
+    for task_id, deadline in required_by.items():
         if task_id not in remaining:
             continue
 
@@ -2596,27 +2615,17 @@ def calculate_status(
     )
 
     cumulative_required = 0
-
     worst_shortfall = 0
-
     worst_slack = None
+    bottleneck = None
 
-    for (
-        deadline,
-        rem,
-        task,
-    ) in deadline_tasks:
-
+    for deadline, rem, task in deadline_tasks:
         cumulative_required += rem
 
         capacity_through_deadline = 0
 
         for block in focus_blocks:
-
-            if (
-                block["start"]
-                >= deadline
-            ):
+            if block["start"] >= deadline:
                 continue
 
             usable_end = min(
@@ -2651,11 +2660,15 @@ def calculate_status(
         ):
             worst_slack = slack
 
-        if slack < 0:
-            worst_shortfall = max(
-                worst_shortfall,
-                abs(slack),
-            )
+        if slack < 0 and abs(slack) > worst_shortfall:
+            worst_shortfall = abs(slack)
+            bottleneck = {
+                "deadline": deadline,
+                "required": cumulative_required,
+                "available": capacity_through_deadline,
+                "shortfall": abs(slack),
+                "task": task,
+            }
 
     pfs_active = any(
         task["task"] == PFS_TASK_NAME
@@ -2673,11 +2686,7 @@ def calculate_status(
         )
 
     if worst_shortfall > 0:
-
-        status = (
-            "🟠 Needs attention"
-        )
-
+        status = "🟠 Needs attention"
         status_detail = (
             "🟠 Needs attention — "
             f"{format_minutes(worst_shortfall)} "
@@ -2685,46 +2694,89 @@ def calculate_status(
             "to meet an actual "
             "High/Medium-priority deadline"
         )
-
         difference = -worst_shortfall
-
     else:
-
         status = "🟢 On track"
 
         if worst_slack is None:
-
             difference = available
-
             status_detail = (
                 "🟢 On track — no hard "
                 "actual deadlines currently "
                 "require additional Focus Time"
             )
-
         else:
-
             difference = worst_slack
-
             status_detail = (
                 "🟢 On track — minimum "
                 "hard-deadline slack is "
                 f"{format_minutes(worst_slack)}"
             )
 
+    print()
+    print("Schedule diagnostic:")
+    print(
+        f"  Focus Time available: "
+        f"{format_minutes(available)}"
+    )
+    print(
+        f"  Active remaining work: "
+        f"{format_minutes(total_remaining)}"
+    )
+    print(
+        f"  Completed work credited: "
+        f"{format_minutes(completed_minutes_total)}"
+    )
+    print(
+        f"  On Hold work excluded: "
+        f"{format_minutes(held_minutes)}"
+    )
+    print(
+        f"  Undated/backlog work: "
+        f"{format_minutes(undated_minutes)}"
+    )
+    print(
+        f"  Deadline-constrained work: "
+        f"{format_minutes(sum(rem for _, rem, _ in deadline_tasks))}"
+    )
+
+    if bottleneck:
+        print("  Bottleneck deadline:")
+        print(
+            f'    Task: "{bottleneck["task"]["task"]}"'
+        )
+        print(
+            "    Deadline: "
+            f'{bottleneck["deadline"].strftime("%Y-%m-%d %I:%M %p")}'
+        )
+        print(
+            "    Required by deadline: "
+            f'{format_minutes(bottleneck["required"])}'
+        )
+        print(
+            "    Focus Time available: "
+            f'{format_minutes(bottleneck["available"])}'
+        )
+        print(
+            "    Shortfall: "
+            f'{format_minutes(bottleneck["shortfall"])}'
+        )
+
     return {
         "status": status,
         "status_detail": status_detail,
         "available": available,
         "deadline_required": sum(
-            rem
-            for _, rem, _
-            in deadline_tasks
+            rem for _, rem, _ in deadline_tasks
         ),
         "pfs_required": pfs_required,
         "total_remaining": total_remaining,
+        "completed_minutes": completed_minutes_total,
+        "held_minutes": held_minutes,
+        "undated_minutes": undated_minutes,
         "difference": difference,
         "pfs_active": pfs_active,
+        "bottleneck": bottleneck,
     }
 
 
@@ -3215,6 +3267,11 @@ def rebuild(
         )
     )
 
+    sync_completed_source_tasks(
+        tasks,
+        completed,
+    )
+
     held_ids = held_task_ids(
         allocations,
         tasks_by_id,
@@ -3289,32 +3346,6 @@ def rebuild(
         f"{len(new_allocations)}"
     )
 
-    if not new_allocations:
-        active_tasks = [
-            task for task in tasks
-            if (
-                not task["completed"]
-                and task["task"] != PFS_TASK_NAME
-                and task.get("minutes", 0) > 0
-            )
-        ]
-        print(
-            "Scheduler diagnostic: "
-            f"{len(active_tasks)} active non-PFS tasks with workload; "
-            f"{len(focus_blocks)} Focus Time blocks available; "
-            f"{len(held_ids)} tasks currently held."
-        )
-        if active_tasks and focus_blocks:
-            print(
-                "No allocation was produced. This means every active task "
-                "was rejected by eligibility/dependency/deadline rules; "
-                "the run will NOT be recorded as a completed scheduling state."
-            )
-            raise RuntimeError(
-                "Scheduler produced zero Task Allocations despite having "
-                "active workload and Focus Time. See the diagnostic above."
-            )
-
     for allocation in new_allocations:
 
         task = allocation["task"]
@@ -3355,8 +3386,6 @@ def rebuild(
             completed_pfs_minutes,
         "new_allocations":
             len(new_allocations),
-        "allocations":
-            refreshed_allocations,
     }
 
 
@@ -3407,6 +3436,11 @@ def main():
             allocations,
             tasks_by_id,
         )
+    )
+
+    sync_completed_source_tasks(
+        tasks,
+        completed,
     )
 
     completed_pfs_minutes = (
@@ -3485,31 +3519,6 @@ def main():
         != previous_inputs
     )
 
-    # An empty Task Allocations database is never a valid steady state when
-    # there is schedulable work and Focus Time available.  In particular, do
-    # not let a previously saved state fingerprint suppress the initial
-    # population of Task Allocations.
-    remaining_schedulable_work = any(
-        (
-            not task["completed"]
-            and task["task"] != PFS_TASK_NAME
-            and task.get("minutes", 0) > 0
-        )
-        for task in tasks
-    )
-    needs_initial_allocation_build = (
-        not allocations
-        and bool(focus_blocks)
-        and remaining_schedulable_work
-    )
-
-    if needs_initial_allocation_build:
-        changed = True
-        print(
-            "Task Allocations is empty while schedulable work and Focus Time "
-            "exist; forcing an initial rebuild."
-        )
-
     reconsider_requested = (
         schedule_status[
             "reconsider_requested"
@@ -3551,35 +3560,20 @@ def main():
             "detected."
         )
 
-    rebuild_result = rebuild(
+    # There is intentionally no active-Focus-Time
+    # protection here. If the inputs change,
+    # the scheduler rebuilds the remaining
+    # schedule immediately.
+
+    rebuild(
         tasks,
         all_focus_blocks,
         focus_blocks,
         allocations,
     )
 
-    # Save the fingerprint of the ACTUAL post-rebuild Task Allocations state,
-    # not the empty/pre-rebuild snapshot.  Otherwise every successful rebuild
-    # looks changed on the next run and the scheduler can churn indefinitely.
-    refreshed_allocations = rebuild_result["allocations"]
-    refreshed_inputs = {
-        "focus":
-            build_focus_fingerprint(
-                all_focus_blocks
-            ),
-        "tasks":
-            build_task_fingerprint(
-                tasks
-            ),
-        "allocations":
-            build_allocation_fingerprint(
-                refreshed_allocations,
-                tasks_by_id,
-            ),
-    }
-
     save_state(
-        refreshed_inputs
+        current_inputs
     )
 
     if reconsider_requested:
