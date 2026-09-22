@@ -3515,12 +3515,13 @@ def rebuild(
             else task["unit"]
         )
 
+        display_amount = format_allocation(
+            allocation["amount_minutes"],
+            unit,
+        )
+
         print(
-            f'  {task["task"]} → '
-            f'{format_allocation(
-                allocation["amount_minutes"],
-                unit
-            )}'
+            f'  {task["task"]} → {display_amount}'
         )
 
         create_allocation(
