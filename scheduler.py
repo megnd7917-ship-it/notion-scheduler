@@ -644,6 +644,14 @@ def read_allocations():
         database_id
     )
 
+    # Resolve the live completion checkbox once so reading allocations uses
+    # the same property name that create_allocation() uses. This is important
+    # when the database calls the checkbox "Completed" rather than
+    # "Completion" (or vice versa).
+    completion_property = get_allocation_completion_property(
+        database_id
+    )
+
     pages = query_data_source(
         data_source_id
     )
@@ -688,9 +696,13 @@ def read_allocations():
                 page,
                 "Unit",
             ),
-            "completed": checkbox_value(
-                page,
-                "Completion",
+            "completed": (
+                checkbox_value(
+                    page,
+                    completion_property,
+                )
+                if completion_property
+                else False
             ),
             "overdue": checkbox_value(
                 page,
@@ -2797,6 +2809,44 @@ def calculate_status(
                 "task": task,
             }
 
+    # Held work is intentionally excluded from the active deadline
+    # shortfall because it cannot currently be scheduled. However, expose
+    # its deadline pressure explicitly so a large derived hold is not hidden
+    # inside the aggregate "On Hold work excluded" number.
+    held_deadline_tasks = []
+
+    for task in tasks:
+        if task["completed"]:
+            continue
+
+        if task["task"] == PFS_TASK_NAME:
+            continue
+
+        if task["page_id"] not in held_ids:
+            continue
+
+        if task["priority"] == "Low":
+            continue
+
+        deadline = actual_deadline_end(task)
+        rem = max(
+            0,
+            task["minutes"]
+            - min(
+                task["minutes"],
+                completed.get(task["page_id"], 0),
+            ),
+        )
+
+        if deadline is not None and rem > 0 and deadline <= horizon:
+            held_deadline_tasks.append(
+                (deadline, rem, task)
+            )
+
+    held_deadline_tasks.sort(
+        key=lambda item: item[0]
+    )
+
     pfs_active = any(
         task["task"] == PFS_TASK_NAME
         and not task["completed"]
@@ -2866,6 +2916,18 @@ def calculate_status(
         f"  Deadline-constrained work: "
         f"{format_minutes(sum(rem for _, rem, _ in deadline_tasks))}"
     )
+
+    print(
+        f"  Held deadline work excluded from shortfall: "
+        f"{format_minutes(sum(rem for _, rem, _ in held_deadline_tasks))}"
+    )
+
+    for deadline, rem, task in held_deadline_tasks:
+        print(
+            f'    Held: "{task["task"]}" — '
+            f'{format_minutes(rem)} remaining, deadline '
+            f'{deadline.strftime("%Y-%m-%d %I:%M %p")}'
+        )
 
     if bottleneck:
         print("  Bottleneck deadline:")
