@@ -1338,6 +1338,97 @@ def dependency_blocked(
     return False
 
 
+def derive_held_task_ids(
+    tasks,
+    explicitly_held_ids,
+):
+    """
+    Dynamically propagate Hold through dependency chains.
+
+    If A is explicitly held and B is blocked by A, B is effectively held.
+    This continues transitively through B's dependents. The source Notion
+    Hold checkbox on downstream tasks is not modified.
+    """
+    tasks_by_id = {
+        task["page_id"]: task
+        for task in tasks
+    }
+
+    dependents = {
+        task["page_id"]: []
+        for task in tasks
+    }
+
+    for task in tasks:
+        for dependency_id in task.get(
+            "dependencies",
+            [],
+        ):
+            if dependency_id in dependents:
+                dependents[dependency_id].append(
+                    task["page_id"]
+                )
+
+    effective_held_ids = set(
+        explicitly_held_ids
+    )
+
+    queue = list(
+        explicitly_held_ids
+    )
+
+    while queue:
+        held_id = queue.pop(0)
+
+        for dependent_id in dependents.get(
+            held_id,
+            [],
+        ):
+            dependent = tasks_by_id.get(
+                dependent_id
+            )
+
+            if not dependent:
+                continue
+
+            if dependent.get("completed"):
+                continue
+
+            if dependent_id in effective_held_ids:
+                continue
+
+            effective_held_ids.add(
+                dependent_id
+            )
+            queue.append(
+                dependent_id
+            )
+
+    derived = (
+        effective_held_ids
+        - set(explicitly_held_ids)
+    )
+
+    print(
+        f"Explicitly held tasks: "
+        f"{len(explicitly_held_ids)}"
+    )
+    print(
+        "Tasks held by dependency on a held task: "
+        f"{len(derived)}"
+    )
+
+    for task_id in sorted(
+        derived,
+        key=lambda value: tasks_by_id[value]["task"]
+    ):
+        print(
+            f'  Derived Hold: "{tasks_by_id[task_id]["task"]}"'
+        )
+
+    return effective_held_ids
+
+
 def dependency_depth(
     task_id,
     tasks_by_id,
@@ -2069,6 +2160,30 @@ def assign_schedule_order(
 # CREATE ALLOCATION
 # ============================================================
 
+def get_allocation_completion_property():
+    """
+    Return the actual completion checkbox property name on Task Allocations.
+    """
+    schema = notion(
+        "GET",
+        f"databases/{TASK_ALLOCATIONS_DB_ID}",
+    )
+
+    properties = schema.get("properties", {})
+
+    for name in (
+        "Completion",
+        "Completed",
+        "Complete",
+        "Done",
+    ):
+        prop = properties.get(name)
+        if prop and prop.get("type") == "checkbox":
+            return name
+
+    return None
+
+
 def create_allocation(
     allocation,
 ):
@@ -2153,10 +2268,6 @@ def create_allocation(
             }
         },
 
-        "Completion": {
-            "checkbox": False
-        },
-
         relation_name: {
             "relation": [
                 {
@@ -2165,6 +2276,24 @@ def create_allocation(
             ]
         },
     }
+
+    # Task Allocations may use a different name for its completion checkbox.
+    # Resolve the live schema instead of assuming the property is named
+    # "Completion". This prevents a Notion 400 when that property does not
+    # exist.
+    completion_property = allocation_completion_property_name(
+        database_id
+    )
+
+    if completion_property:
+        properties[completion_property] = {
+            "checkbox": False
+        }
+    else:
+        print(
+            "Warning: Task Allocations has no completion checkbox; "
+            "creating allocation without a completion property."
+        )
 
     result = notion(
         "POST",
@@ -2504,7 +2633,6 @@ def calculate_status(
             continue
 
         remaining[task["page_id"]] = rem
-        total_remaining += rem
 
         if task.get("deadline") is None:
             undated_minutes += rem
@@ -2617,7 +2745,6 @@ def calculate_status(
     cumulative_required = 0
     worst_shortfall = 0
     worst_slack = None
-    bottleneck = None
 
     for deadline, rem, task in deadline_tasks:
         cumulative_required += rem
@@ -2770,13 +2897,9 @@ def calculate_status(
             rem for _, rem, _ in deadline_tasks
         ),
         "pfs_required": pfs_required,
-        "total_remaining": total_remaining,
-        "completed_minutes": completed_minutes_total,
-        "held_minutes": held_minutes,
         "undated_minutes": undated_minutes,
         "difference": difference,
         "pfs_active": pfs_active,
-        "bottleneck": bottleneck,
     }
 
 
