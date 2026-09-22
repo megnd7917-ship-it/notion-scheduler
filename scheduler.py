@@ -2203,8 +2203,6 @@ def allocation_completion_value(page):
     ]
 
     if property_info["type"] == "checkbox":
-        # Notion returns a checkbox property as:
-        # {"checkbox": True/False}, not {"checkbox": {"checked": ...}}.
         return bool(
             property_data.get("checkbox", False)
         )
@@ -2798,8 +2796,9 @@ def calculate_status(
     cumulative_required = 0
     worst_shortfall = 0
     worst_slack = None
+    bottleneck_task_ids = set()
 
-    for deadline, rem, task in deadline_tasks:
+    for index, (deadline, rem, task) in enumerate(deadline_tasks):
         cumulative_required += rem
 
         capacity_through_deadline = 0
@@ -2848,6 +2847,10 @@ def calculate_status(
                 "available": capacity_through_deadline,
                 "shortfall": abs(slack),
                 "task": task,
+            }
+            bottleneck_task_ids = {
+                item[2]["page_id"]
+                for item in deadline_tasks[: index + 1]
             }
 
     # Held work is intentionally excluded from the active deadline
@@ -3003,6 +3006,7 @@ def calculate_status(
         "undated_minutes": undated_minutes,
         "difference": difference,
         "pfs_active": pfs_active,
+        "bottleneck_task_ids": sorted(bottleneck_task_ids),
     }
 
 
@@ -3435,6 +3439,53 @@ def save_state(state):
     )
 
 
+def sync_bottleneck_icons(
+    allocations,
+    tasks_by_id,
+    bottleneck_task_ids,
+):
+    """Show the active bottleneck on Task Allocation pages.
+
+    Task Allocations normally have no page icon. Allocations belonging to
+    tasks contributing to the current hard-deadline bottleneck get a warning
+    icon. When they stop contributing, the icon is removed.
+    """
+    bottleneck_task_ids = set(
+        bottleneck_task_ids or []
+    )
+
+    for allocation in allocations:
+        task_id = allocation_task_id(
+            allocation,
+            tasks_by_id,
+        )
+
+        if not task_id:
+            continue
+
+        should_warn = (
+            task_id in bottleneck_task_ids
+            and not allocation["completed"]
+            and not allocation["hold"]
+        )
+
+        if should_warn:
+            icon = {
+                "type": "emoji",
+                "emoji": "⚠️",
+            }
+        else:
+            icon = None
+
+        notion(
+            "PATCH",
+            f'pages/{allocation["page_id"]}',
+            json={
+                "icon": icon,
+            },
+        )
+
+
 # ============================================================
 # REBUILD
 # ============================================================
@@ -3608,6 +3659,25 @@ def rebuild(
         all_focus_blocks,
     )
 
+    # Recalculate the bottleneck against the schedule now that the new
+    # allocations exist, then reflect it visually on the Daily Plan.
+    refreshed_completed = calculate_completed_work(
+        refreshed_allocations,
+        tasks_by_id,
+    )
+    refreshed_status = calculate_status(
+        tasks,
+        refreshed_completed,
+        focus_blocks,
+        completed_pfs_minutes,
+        held_ids,
+    )
+    sync_bottleneck_icons(
+        refreshed_allocations,
+        tasks_by_id,
+        refreshed_status["bottleneck_task_ids"],
+    )
+
     return {
         "completed_pfs_minutes":
             completed_pfs_minutes,
@@ -3779,6 +3849,19 @@ def main():
         print(
             "Scheduler finished without "
             "rebuilding the schedule."
+        )
+
+        status_info = calculate_status(
+            tasks,
+            completed,
+            focus_blocks,
+            completed_pfs_minutes,
+            held_ids,
+        )
+        sync_bottleneck_icons(
+            allocations,
+            tasks_by_id,
+            status_info["bottleneck_task_ids"],
         )
 
         save_state(current_inputs)
