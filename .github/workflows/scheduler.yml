@@ -2,21 +2,38 @@ name: Notion Scheduler
 
 on:
   workflow_dispatch:
+
+  # Poll for meaningful changes once an hour.
+  # The scheduler itself decides whether anything changed.
   schedule:
-    - cron: "0 16 * * *"
+    - cron: "*/15 * * * *"
+
+    # Morning safety-net rebuild.
+    # This is approximately 5–6 AM Pacific depending on DST.
+    - cron: "30 13 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: notion-scheduler
+  cancel-in-progress: false
 
 jobs:
   schedule:
     runs-on: ubuntu-latest
 
+    env:
+      FORCE_REBUILD: ${{ github.event_name == 'schedule' && github.event.schedule == '30 13 * * *' }}
+
     steps:
-      - name: Check out scheduler
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: pip install requests
@@ -25,3 +42,17 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         run: python scheduler.py
+
+      - name: Save scheduler state
+        run: |
+          if git diff --quiet -- .scheduler_state.json; then
+            echo "No scheduler state changes."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .scheduler_state.json
+          git commit -m "Update scheduler state"
+          git push
