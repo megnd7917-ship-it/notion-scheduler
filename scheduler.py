@@ -522,6 +522,10 @@ def read_tasks():
                     page,
                     "Completed",
                 ),
+                "hold": checkbox_value(
+                    page,
+                    "Hold",
+                ),
                 "dependencies": relation_ids(
                     page,
                     DEPENDENCY_PROPERTY_NAME,
@@ -644,14 +648,6 @@ def read_allocations():
         database_id
     )
 
-    # Resolve the live completion checkbox once so reading allocations uses
-    # the same property name that create_allocation() uses. This is important
-    # when the database calls the checkbox "Completed" rather than
-    # "Completion" (or vice versa).
-    completion_property = get_allocation_completion_property(
-        database_id
-    )
-
     pages = query_data_source(
         data_source_id
     )
@@ -696,14 +692,7 @@ def read_allocations():
                 page,
                 "Unit",
             ),
-            "completed": (
-                checkbox_value(
-                    page,
-                    completion_property,
-                )
-                if completion_property
-                else False
-            ),
+            "completed": allocation_completion_value(page),
             "overdue": checkbox_value(
                 page,
                 "Overdue",
@@ -873,26 +862,25 @@ def sync_completed_source_tasks(
 def held_task_ids(
     allocations,
     tasks_by_id,
+    previously_derived_hold_allocation_ids=None,
 ):
-    """Return the effective held-task set.
+    """Return tasks held by Task Allocation Hold checkboxes.
 
-    A task is explicitly held when it has an unfinished Task Allocation
-    with Hold checked. Any unfinished task that is downstream of a held
-    task (via the authoritative Blocked by relation) is also treated as
-    held. This propagation is transitive and is recalculated on every run.
+    Hold lives on Task Allocations, not on the source To Do databases.
+    An unfinished allocation with Hold checked explicitly holds its task.
+    Every unfinished dependent task is then held transitively.
 
-    We do NOT write Hold back to downstream source tasks. Their effective
-    hold is derived from the dependency graph, so releasing the upstream
-    hold automatically makes them schedulable again unless another hold
-    or dependency still prevents them.
+    The scheduler records which allocation pages it previously marked as
+    derived holds so a user-created Hold on another allocation is preserved.
     """
+    previously_derived = set(
+        previously_derived_hold_allocation_ids or []
+    )
+
     explicitly_held = set()
 
     for allocation in allocations:
-        if allocation["completed"]:
-            continue
-
-        if not allocation["hold"]:
+        if allocation["completed"] or not allocation["hold"]:
             continue
 
         task_id = allocation_task_id(
@@ -903,15 +891,12 @@ def held_task_ids(
         if not task_id:
             continue
 
-        task = tasks_by_id.get(task_id)
-
-        if task and task["completed"]:
-            continue
-
-        explicitly_held.add(task_id)
-
-    if not explicitly_held:
-        return set()
+        # A Hold on an allocation that was not previously written by the
+        # scheduler is a user-created/explicit Hold.
+        if allocation["page_id"] not in previously_derived:
+            task = tasks_by_id.get(task_id)
+            if task and not task.get("completed"):
+                explicitly_held.add(task_id)
 
     _, dependents = build_dependency_graph(
         list(tasks_by_id.values())
@@ -922,55 +907,98 @@ def held_task_ids(
 
     while queue:
         held_id = queue.pop(0)
-
-        for dependent_id in dependents.get(
-            held_id,
-            set(),
-        ):
-            dependent = tasks_by_id.get(
-                dependent_id
-            )
-
-            if not dependent:
+        for dependent_id in dependents.get(held_id, set()):
+            dependent = tasks_by_id.get(dependent_id)
+            if not dependent or dependent.get("completed"):
                 continue
+            if dependent_id not in effective_held:
+                effective_held.add(dependent_id)
+                queue.append(dependent_id)
 
-            if dependent["completed"]:
-                continue
+    derived = effective_held - explicitly_held
 
-            if dependent_id in effective_held:
-                continue
+    print(f"Explicitly held tasks: {len(explicitly_held)}")
+    print(f"Tasks held by dependency on a held task: {len(derived)}")
+    for task_id in sorted(derived, key=lambda value: tasks_by_id[value]["task"]):
+        print(f'  Derived Hold: "{tasks_by_id[task_id]["task"]}"')
 
-            effective_held.add(
-                dependent_id
-            )
-            queue.append(
-                dependent_id
-            )
+    return effective_held, explicitly_held, derived
 
-    derived = (
-        effective_held
-        - explicitly_held
+
+def sync_allocation_holds(
+    allocations,
+    tasks_by_id,
+    effective_held_ids,
+    previously_derived_hold_allocation_ids=None,
+):
+    """Synchronize Hold checkboxes on Task Allocation pages only.
+
+    A checked Hold that the user created stays explicit. A Hold created by
+    dependency propagation is tracked by allocation page ID so it can be
+    removed automatically when the upstream Hold is released.
+    """
+    previously_derived = set(
+        previously_derived_hold_allocation_ids or []
     )
 
-    if explicitly_held:
+    new_derived = set()
+    changed = 0
+
+    for allocation in allocations:
+        task_id = allocation_task_id(
+            allocation,
+            tasks_by_id,
+        )
+        if not task_id:
+            continue
+
+        task = tasks_by_id.get(task_id)
+        if not task or task.get("completed"):
+            desired = False
+        elif allocation["page_id"] in previously_derived:
+            # This Hold was created by the scheduler previously. Keep it only
+            # while the dependency chain still requires it.
+            desired = task_id in effective_held_ids
+            if desired:
+                new_derived.add(allocation["page_id"])
+        elif allocation["hold"]:
+            # The user checked this allocation's Hold box. Preserve it.
+            desired = True
+        elif task_id in effective_held_ids:
+            # This is a newly derived dependent hold.
+            desired = True
+            new_derived.add(allocation["page_id"])
+        else:
+            desired = False
+
+        if allocation["hold"] == desired:
+            continue
+
         print(
-            f"Explicitly held tasks: "
-            f"{len(explicitly_held)}"
+            f'{"Checking" if desired else "Clearing"} Hold on allocation: '
+            f'"{allocation["name"]}"'
+        )
+        notion(
+            "PATCH",
+            f'pages/{allocation["page_id"]}',
+            json={
+                "properties": {
+                    "Hold": {
+                        "checkbox": desired
+                    }
+                }
+            },
+        )
+        allocation["hold"] = desired
+        changed += 1
+
+    if changed:
+        print(
+            f"Synchronized Hold for {changed} "
+            "Task Allocation(s)."
         )
 
-    if derived:
-        print(
-            f"Tasks held by dependency on a held "
-            f"task: {len(derived)}"
-        )
-
-        for task_id in sorted(derived):
-            print(
-                f'  Derived Hold: "'
-                f'{tasks_by_id[task_id]["task"]}"'
-            )
-
-    return effective_held
+    return new_derived
 
 
 # ============================================================
@@ -1348,97 +1376,6 @@ def dependency_blocked(
         return True
 
     return False
-
-
-def derive_held_task_ids(
-    tasks,
-    explicitly_held_ids,
-):
-    """
-    Dynamically propagate Hold through dependency chains.
-
-    If A is explicitly held and B is blocked by A, B is effectively held.
-    This continues transitively through B's dependents. The source Notion
-    Hold checkbox on downstream tasks is not modified.
-    """
-    tasks_by_id = {
-        task["page_id"]: task
-        for task in tasks
-    }
-
-    dependents = {
-        task["page_id"]: []
-        for task in tasks
-    }
-
-    for task in tasks:
-        for dependency_id in task.get(
-            "dependencies",
-            [],
-        ):
-            if dependency_id in dependents:
-                dependents[dependency_id].append(
-                    task["page_id"]
-                )
-
-    effective_held_ids = set(
-        explicitly_held_ids
-    )
-
-    queue = list(
-        explicitly_held_ids
-    )
-
-    while queue:
-        held_id = queue.pop(0)
-
-        for dependent_id in dependents.get(
-            held_id,
-            [],
-        ):
-            dependent = tasks_by_id.get(
-                dependent_id
-            )
-
-            if not dependent:
-                continue
-
-            if dependent.get("completed"):
-                continue
-
-            if dependent_id in effective_held_ids:
-                continue
-
-            effective_held_ids.add(
-                dependent_id
-            )
-            queue.append(
-                dependent_id
-            )
-
-    derived = (
-        effective_held_ids
-        - set(explicitly_held_ids)
-    )
-
-    print(
-        f"Explicitly held tasks: "
-        f"{len(explicitly_held_ids)}"
-    )
-    print(
-        "Tasks held by dependency on a held task: "
-        f"{len(derived)}"
-    )
-
-    for task_id in sorted(
-        derived,
-        key=lambda value: tasks_by_id[value]["task"]
-    ):
-        print(
-            f'  Derived Hold: "{tasks_by_id[task_id]["task"]}"'
-        )
-
-    return effective_held_ids
 
 
 def dependency_depth(
@@ -2172,6 +2109,53 @@ def assign_schedule_order(
 # CREATE ALLOCATION
 # ============================================================
 
+def _completion_checkbox_name_from_properties(properties):
+    """Find the Task Allocations completion checkbox from a live schema/page."""
+    preferred_names = (
+        "Completion",
+        "Completed",
+        "Complete",
+        "Done",
+    )
+
+    for name in preferred_names:
+        prop = properties.get(name)
+        if prop and prop.get("type") == "checkbox":
+            return name
+
+    # Fall back to the only remaining checkbox. Task Allocations also has
+    # Hold and Overdue checkboxes, so exclude those explicitly. This makes
+    # the reader resilient if the completion checkbox has been renamed.
+    candidates = [
+        name
+        for name, prop in properties.items()
+        if (
+            prop.get("type") == "checkbox"
+            and name not in {"Hold", "Overdue"}
+        )
+    ]
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
+
+
+def allocation_completion_value(page):
+    """Read completion directly from the returned Task Allocation page."""
+    property_name = _completion_checkbox_name_from_properties(
+        page.get("properties", {})
+    )
+
+    if not property_name:
+        return False
+
+    return checkbox_value(
+        page,
+        property_name,
+    )
+
+
 def get_allocation_completion_property(database_id):
     """
     Return the actual completion checkbox property name on Task Allocations.
@@ -2181,19 +2165,9 @@ def get_allocation_completion_property(database_id):
         f"databases/{database_id}",
     )
 
-    properties = schema.get("properties", {})
-
-    for name in (
-        "Completion",
-        "Completed",
-        "Complete",
-        "Done",
-    ):
-        prop = properties.get(name)
-        if prop and prop.get("type") == "checkbox":
-            return name
-
-    return None
+    return _completion_checkbox_name_from_properties(
+        schema.get("properties", {})
+    )
 
 
 def create_allocation(
@@ -3457,7 +3431,7 @@ def rebuild(
         completed,
     )
 
-    held_ids = held_task_ids(
+    held_ids, _, _ = held_task_ids(
         allocations,
         tasks_by_id,
     )
@@ -3593,6 +3567,9 @@ def main():
 
     print()
 
+    state = load_state()
+    previously_derived_hold_allocation_ids = state.get("derived_hold_allocation_ids", [])
+
     tasks = read_tasks()
 
     all_focus_blocks, focus_blocks = (
@@ -3636,9 +3613,17 @@ def main():
         )
     )
 
-    held_ids = held_task_ids(
+    held_ids, explicitly_held_ids, derived_hold_ids = held_task_ids(
         allocations,
         tasks_by_id,
+        previously_derived_hold_allocation_ids,
+    )
+
+    derived_hold_allocation_ids = sync_allocation_holds(
+        allocations,
+        tasks_by_id,
+        held_ids,
+        previously_derived_hold_allocation_ids,
     )
 
     update_overdue_flags(
@@ -3658,8 +3643,6 @@ def main():
         )
     )
 
-    state = load_state()
-
     current_inputs = {
         "focus":
             build_focus_fingerprint(
@@ -3676,6 +3659,7 @@ def main():
                 allocations,
                 tasks_by_id,
             ),
+        "derived_hold_allocation_ids": sorted(derived_hold_allocation_ids),
     }
 
     force_rebuild = (
@@ -3697,6 +3681,9 @@ def main():
 
         "allocations":
             state.get("allocations"),
+
+        "derived_hold_allocation_ids":
+            state.get("derived_hold_allocation_ids", []),
     }
 
     changed = (
@@ -3724,6 +3711,7 @@ def main():
             "rebuilding the schedule."
         )
 
+        save_state(current_inputs)
         return
 
     if reconsider_requested:
