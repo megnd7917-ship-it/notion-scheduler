@@ -3486,39 +3486,86 @@ def sync_bottleneck_icons(
         )
 
 
-# ============================================================
 # REBUILD
 # ============================================================
-
-def delete_incomplete_allocations(
-    allocations
+def update_allocation_page(
+    allocation,
+    desired,
 ):
-    to_delete = [
-        allocation
-        for allocation in allocations
-        if (
-            not allocation["completed"]
-            and not allocation["hold"]
+    task = desired["task"]
+    unit = (
+        "Hours"
+        if task["task"] == PFS_TASK_NAME
+        else task["unit"]
+    )
+    display_amount = format_allocation(
+        desired["amount_minutes"],
+        unit,
+    )
+    properties = {
+        "Name": {"title": [{"text": {"content": f'{task["task"]} — {display_amount}'}}]},
+        "Schedule Order": {"number": desired.get("schedule_order", 0)},
+        "Overdue": {"checkbox": desired.get("overdue", False)},
+        "Focus time": {"relation": [{"id": desired["focus_page_id"]}]},
+        "Allocation": {"number": minutes_to_units(desired["amount_minutes"], unit)},
+        "Unit": {"select": {"name": unit}},
+    }
+    notion("PATCH", f'pages/{allocation["page_id"]}', json={"properties": properties})
+    time.sleep(CREATE_REQUEST_DELAY)
+
+
+def reconcile_allocations(
+    existing_allocations,
+    desired_allocations,
+    tasks_by_id,
+):
+    """Update reusable allocations in place; remove only obsolete ones."""
+    desired_by_key = {}
+    for desired in desired_allocations:
+        key = (
+            normalize_notion_id(desired["task"]["page_id"]),
+            normalize_notion_id(desired["focus_page_id"]),
         )
+        desired_by_key[key] = desired
+
+    reusable = {}
+    for allocation in existing_allocations:
+        if allocation["completed"] or allocation["hold"]:
+            continue
+        task_id = allocation_task_id(allocation, tasks_by_id)
+        if not task_id:
+            continue
+        for focus_id in allocation["focus_ids"]:
+            key = (normalize_notion_id(task_id), normalize_notion_id(focus_id))
+            reusable.setdefault(key, []).append(allocation)
+
+    used = set()
+    to_create = []
+    for key, desired in desired_by_key.items():
+        existing = next((a for a in reusable.get(key, []) if a["page_id"] not in used), None)
+        if existing:
+            update_allocation_page(existing, desired)
+            used.add(existing["page_id"])
+        else:
+            to_create.append(desired)
+
+    to_remove = [
+        a for a in existing_allocations
+        if not a["completed"] and not a["hold"] and a["page_id"] not in used
     ]
 
-    if not to_delete:
-        print(
-            "No provisional allocations "
-            "to remove."
-        )
-        return
+    print(f"Allocations updated: {len(used)}")
+    print(f"Allocations to remove: {len(to_remove)}")
+    print(f"New allocations to create: {len(to_create)}")
 
-    print(
-        f"Removing {len(to_delete)} "
-        "provisional allocation(s)..."
-    )
+    for allocation in to_remove:
+        archive_page(allocation["page_id"])
 
-    for allocation in to_delete:
-
-        archive_page(
-            allocation["page_id"]
-        )
+    for allocation in to_create:
+        task = allocation["task"]
+        unit = "Hours" if task["task"] == PFS_TASK_NAME else task["unit"]
+        print(f'{task["task"]} → {format_allocation(allocation["amount_minutes"], unit)}')
+        create_allocation(allocation)
 
 
 def rebuild(
@@ -3554,8 +3601,7 @@ def rebuild(
         tasks_by_id,
     )
 
-    # Validate dependencies before
-    # deleting provisional allocations.
+    # Validate dependencies before reconciling allocations.
     build_dependency_graph(tasks)
 
     completed_pfs_minutes = (
@@ -3564,10 +3610,6 @@ def rebuild(
             tasks_by_id,
             all_focus_blocks,
         )
-    )
-
-    delete_incomplete_allocations(
-        allocations
     )
 
     pfs_task = next(
@@ -3618,33 +3660,11 @@ def rebuild(
         datetime.now(TZ),
     )
 
-    print(
-        f"New allocations to create: "
-        f"{len(new_allocations)}"
+    reconcile_allocations(
+        allocations,
+        new_allocations,
+        tasks_by_id,
     )
-
-    for allocation in new_allocations:
-
-        task = allocation["task"]
-
-        unit = (
-            "Hours"
-            if task["task"] == PFS_TASK_NAME
-            else task["unit"]
-        )
-
-        display_amount = format_allocation(
-            allocation["amount_minutes"],
-            unit,
-        )
-
-        print(
-            f'  {task["task"]} → {display_amount}'
-        )
-
-        create_allocation(
-            allocation
-        )
 
     # Read the database again so the newly
     # created allocations are included when
@@ -3659,8 +3679,6 @@ def rebuild(
         all_focus_blocks,
     )
 
-    # Recalculate the bottleneck against the schedule now that the new
-    # allocations exist, then reflect it visually on the Daily Plan.
     refreshed_completed = calculate_completed_work(
         refreshed_allocations,
         tasks_by_id,
