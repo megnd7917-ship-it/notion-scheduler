@@ -27,6 +27,18 @@ PFS_TASK_NAME = "PFS weekly hours"
 PFS_DATABASE_NAME = "PFS To-Do"
 PFS_WEEKLY_TARGET_MINUTES = 30 * 60
 
+# Only these task databases create a hard "must fit before deadline"
+# scheduling deficit. Other deadlines remain useful as soft scheduling
+# preferences, but they do not make the schedule report a capacity
+# shortfall.
+HARD_DEADLINE_DATABASES = {
+    "COM 210 To-Do",
+    "ENL 248 To-Do",
+    "Independent Study To-Do",
+    "LSAT To-Do",
+    "Applications To-Do",
+}
+
 CREATE_REQUEST_DELAY = 0.5
 MAX_RATE_LIMIT_RETRIES = 5
 
@@ -2109,24 +2121,39 @@ def assign_schedule_order(
 # CREATE ALLOCATION
 # ============================================================
 
-def _completion_checkbox_name_from_properties(properties):
-    """Find the Task Allocations completion checkbox from a live schema/page."""
+def _completion_property_from_properties(properties):
+    """Find the existing Task Allocations completion property.
+
+    Prefer a checkbox, but also support a Notion Status property whose
+    Completed option represents completion. This replaces the old assumption
+    that completion must be a checkbox.
+    """
     preferred_names = (
         "Completion",
         "Completed",
         "Complete",
         "Done",
+        "Status",
     )
 
     for name in preferred_names:
         prop = properties.get(name)
-        if prop and prop.get("type") == "checkbox":
-            return name
+        if not prop:
+            continue
 
-    # Fall back to the only remaining checkbox. Task Allocations also has
-    # Hold and Overdue checkboxes, so exclude those explicitly. This makes
-    # the reader resilient if the completion checkbox has been renamed.
-    candidates = [
+        if prop.get("type") == "checkbox":
+            return {"name": name, "type": "checkbox"}
+
+        if prop.get("type") == "status":
+            options = prop.get("status", {}).get("options", [])
+            if any(
+                option.get("name", "").strip().lower()
+                in {"completed", "complete", "done"}
+                for option in options
+            ):
+                return {"name": name, "type": "status"}
+
+    checkbox_candidates = [
         name
         for name, prop in properties.items()
         if (
@@ -2135,37 +2162,72 @@ def _completion_checkbox_name_from_properties(properties):
         )
     ]
 
-    if len(candidates) == 1:
-        return candidates[0]
+    if len(checkbox_candidates) == 1:
+        return {
+            "name": checkbox_candidates[0],
+            "type": "checkbox",
+        }
+
+    status_candidates = []
+    for name, prop in properties.items():
+        if prop.get("type") != "status":
+            continue
+        options = prop.get("status", {}).get("options", [])
+        if any(
+            option.get("name", "").strip().lower()
+            in {"completed", "complete", "done"}
+            for option in options
+        ):
+            status_candidates.append(name)
+
+    if len(status_candidates) == 1:
+        return {
+            "name": status_candidates[0],
+            "type": "status",
+        }
 
     return None
 
 
 def allocation_completion_value(page):
-    """Read completion directly from the returned Task Allocation page."""
-    property_name = _completion_checkbox_name_from_properties(
+    """Read completion from the existing Task Allocation property."""
+    property_info = _completion_property_from_properties(
         page.get("properties", {})
     )
 
-    if not property_name:
+    if not property_info:
         return False
 
-    return checkbox_value(
-        page,
-        property_name,
-    )
+    property_data = page["properties"][
+        property_info["name"]
+    ]
+
+    if property_info["type"] == "checkbox":
+        # Notion returns a checkbox property as:
+        # {"checkbox": True/False}, not {"checkbox": {"checked": ...}}.
+        return bool(
+            property_data.get("checkbox", False)
+        )
+
+    status = property_data.get("status")
+    if not status:
+        return False
+
+    return status.get("name", "").strip().lower() in {
+        "completed",
+        "complete",
+        "done",
+    }
 
 
 def get_allocation_completion_property(database_id):
-    """
-    Return the actual completion checkbox property name on Task Allocations.
-    """
+    """Return the existing Task Allocations completion property."""
     schema = notion(
         "GET",
         f"databases/{database_id}",
     )
 
-    return _completion_checkbox_name_from_properties(
+    return _completion_property_from_properties(
         schema.get("properties", {})
     )
 
@@ -2272,14 +2334,12 @@ def create_allocation(
     )
 
     if completion_property:
-        properties[completion_property] = {
-            "checkbox": False
-        }
-    else:
-        print(
-            "Warning: Task Allocations has no completion checkbox; "
-            "creating allocation without a completion property."
-        )
+        if completion_property["type"] == "checkbox":
+            properties[completion_property["name"]] = {
+                "checkbox": False
+            }
+        # A Status property should use its database default for a new page.
+        # We only need to recognize its Completed state when reading pages.
 
     result = notion(
         "POST",
@@ -2567,7 +2627,7 @@ def calculate_status(
     completed_pfs_minutes,
     held_ids,
 ):
-    """Calculate schedule status and expose the source of any shortfall."""
+    """Calculate status using hard deadlines only for configured task types."""
     now = datetime.now(TZ)
 
     horizon = (
@@ -2640,6 +2700,13 @@ def calculate_status(
             continue
 
         if task["priority"] == "Low":
+            continue
+
+        # Only school/application/test work creates a hard
+        # before-deadline capacity requirement. Deadlines on work,
+        # personal, and other flexible tasks remain soft scheduling
+        # preferences and do not create a deficit.
+        if task["database"] not in HARD_DEADLINE_DATABASES:
             continue
 
         deadline = actual_deadline_end(task)
@@ -3546,6 +3613,8 @@ def rebuild(
             completed_pfs_minutes,
         "new_allocations":
             len(new_allocations),
+        "allocations":
+            refreshed_allocations,
     }
 
 
@@ -3739,11 +3808,21 @@ def main():
     # the scheduler rebuilds the remaining
     # schedule immediately.
 
-    rebuild(
+    rebuild_result = rebuild(
         tasks,
         all_focus_blocks,
         focus_blocks,
         allocations,
+    )
+
+    # Save the state of the schedule we just created, not the old
+    # allocation set that existed before the rebuild. This keeps the
+    # 15-minute polling loop quiet until something actually changes.
+    current_inputs["allocations"] = (
+        build_allocation_fingerprint(
+            rebuild_result["allocations"],
+            tasks_by_id,
+        )
     )
 
     save_state(
