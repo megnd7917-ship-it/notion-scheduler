@@ -21,6 +21,13 @@ PLANNING_DAYS = 14
 MIN_CHUNK_MINUTES = 15
 PREFERRED_MAX_CHUNK_MINUTES = 45
 
+# Reserve part of each Focus Time day for work whose deadline is still ahead.
+# This prevents urgent work from consuming every available block and creating
+# a permanent catch-up cycle. The reserve is used whenever the urgent workload
+# can fit without it; genuinely overloaded urgent days may temporarily consume
+# the reserve.
+AHEAD_CAPACITY_FRACTION = 0.20
+
 DEPENDENCY_PROPERTY_NAME = "Blocked by"
 
 PFS_TASK_NAME = "PFS weekly hours"
@@ -1693,15 +1700,20 @@ def choose_allocation_size(
         }
     )
 
-    if (
-        task["continuous"]
-        or deadline_forces_whole_task
-    ):
+    # Continuous tasks must fit in one block. For tasks due today/overdue,
+    # however, do not require the entire remaining task to fit in a single
+    # Focus Time block: these tasks have the highest urgency and may need to
+    # be split across multiple blocks in order to actually get onto today's
+    # schedule.
+    if task["continuous"]:
 
         if remaining_minutes <= maximum:
             return remaining_minutes
 
         return 0
+
+    if deadline_forces_whole_task and remaining_minutes <= maximum:
+        return remaining_minutes
 
     if maximum <= PREFERRED_MAX_CHUNK_MINUTES:
         return maximum
@@ -1767,6 +1779,37 @@ def pfs_score(
 # SCHEDULE TASKS
 # ============================================================
 
+def is_urgent_deadline_task(task, now):
+    """Return True when a task is overdue or due today.
+
+    Low-priority tasks do not receive emergency treatment merely because their
+    deadline is today; they remain part of the ordinary planning pool.
+    """
+    return (
+        task.get("priority") != "Low"
+        and deadline_day_kind(task, now) in {"overdue", "today"}
+    )
+
+
+def build_daily_capacity(focus_blocks):
+    """Return immutable Focus Time capacity by calendar day."""
+    daily = {}
+    for block in focus_blocks:
+        day = block["start"].date()
+        daily[day] = daily.get(day, 0) + block.get(
+            "capacity", block.get("remaining", 0)
+        )
+    return daily
+
+
+def daily_ahead_reserve(daily_capacity):
+    """Return the amount of each day's capacity reserved for future work."""
+    return {
+        day: int(capacity * AHEAD_CAPACITY_FRACTION)
+        for day, capacity in daily_capacity.items()
+    }
+
+
 def schedule_tasks(
     tasks,
     focus_blocks,
@@ -1831,6 +1874,11 @@ def schedule_tasks(
     )
 
     new_allocations = []
+
+    daily_capacity = build_daily_capacity(focus_blocks)
+    daily_reserve = daily_ahead_reserve(daily_capacity)
+    daily_future_allocated = {day: 0 for day in daily_capacity}
+    daily_urgent_allocated = {day: 0 for day in daily_capacity}
 
     for block in focus_blocks:
 
@@ -1937,25 +1985,64 @@ def schedule_tasks(
             if not candidates:
                 break
 
+            # Protect an ahead-of-deadline reserve on every day. We do not
+            # reserve time blindly: if today's/overdue work cannot fit inside
+            # the remaining non-reserved capacity, urgent work is allowed to
+            # consume the reserve. This creates a real path to getting ahead
+            # without sacrificing imminent deadlines.
+            day = block["start"].date()
             urgent = [
                 candidate
-                for candidate
-                in candidates
+                for candidate in candidates
                 if (
                     candidate[0] == "general"
-                    and
-                    candidate[2].get(
-                        "effective_deadline"
+                    and is_urgent_deadline_task(
+                        candidate[2], now
                     )
-                    and
-                    candidate[2][
-                        "effective_deadline"
-                    ] <= now
                 )
             ]
+            future = [
+                candidate
+                for candidate in candidates
+                if candidate not in urgent
+            ]
+
+            reserve = daily_reserve.get(day, 0)
+            future_used = daily_future_allocated.get(day, 0)
+            reserve_remaining = max(
+                0,
+                reserve - future_used,
+            )
+
+            # Urgent work gets first claim on the day, but only to the
+            # extent that it actually needs the day's capacity. The reserve
+            # is therefore a *buffer*, not a reason to postpone work that is
+            # genuinely due today. If the urgent workload itself exceeds the
+            # non-reserved portion of the day, it is allowed to consume the
+            # reserve and the scheduler reports the resulting catch-up
+            # pressure through the normal deadline diagnostic.
+            urgent_remaining = sum(
+                remaining.get(candidate[2]["page_id"], 0)
+                for candidate in urgent
+            )
+            urgent_capacity_remaining = max(
+                0,
+                daily_capacity.get(day, 0)
+                - reserve
+                - daily_urgent_allocated.get(day, 0),
+            )
 
             if urgent:
+                # Keep working on today's urgent work until it is cleared.
+                # The reserve matters when urgent work would otherwise consume
+                # essentially the entire day: once the urgent workload is small
+                # enough, future work can use the reserved portion instead of
+                # letting it sit unused.
                 candidates = urgent
+            elif future:
+                candidates = future
+            else:
+                candidates = []
 
             candidates.sort(
                 key=lambda item: item[1],
@@ -2011,6 +2098,17 @@ def schedule_tasks(
                 "focus_page_id": block["page_id"],
                 "focus_page_start": block["start"],
             })
+
+            if is_urgent_deadline_task(chosen, now):
+                daily_urgent_allocated[day] = (
+                    daily_urgent_allocated.get(day, 0)
+                    + amount
+                )
+            else:
+                daily_future_allocated[day] = (
+                    daily_future_allocated.get(day, 0)
+                    + amount
+                )
 
             block["remaining"] -= amount
 
@@ -2593,6 +2691,12 @@ def calculate_status(
         for block in focus_blocks
     )
 
+    daily_capacity = build_daily_capacity(focus_blocks)
+    ahead_reserve = int(
+        sum(daily_capacity.values())
+        * AHEAD_CAPACITY_FRACTION
+    )
+
     remaining = {}
 
     total_remaining = 0
@@ -2924,6 +3028,10 @@ def calculate_status(
         f"{format_minutes(available)}"
     )
     print(
+        f"  Ahead-of-deadline reserve: "
+        f"{format_minutes(ahead_reserve)}"
+    )
+    print(
         f"  Active remaining work: "
         f"{format_minutes(total_remaining)}"
     )
@@ -2982,6 +3090,7 @@ def calculate_status(
         "status": status,
         "status_detail": status_detail,
         "available": available,
+        "ahead_reserve": ahead_reserve,
         "deadline_required": sum(
             rem for _, rem, _ in deadline_tasks
         ),
