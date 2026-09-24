@@ -3085,6 +3085,18 @@ def _find_or_create_schedule_status_page(pages, data_source_id, name):
     return response
 
 
+def _text_property(value):
+    """Build a Notion rich-text property payload from plain text."""
+    return {
+        "rich_text": [
+            {
+                "type": "text",
+                "text": {"content": str(value)},
+            }
+        ]
+    }
+
+
 def _update_status_page(page, property_names, status_info, mode):
     now = datetime.now(TZ)
 
