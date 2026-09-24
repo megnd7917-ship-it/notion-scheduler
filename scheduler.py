@@ -3029,29 +3029,44 @@ def _schedule_status_page_properties(page):
 
 
 def _find_or_create_schedule_status_page(pages, data_source_id, name):
+    """Find one of the three canonical Schedule Status pages.
+
+    The canonical names are deliberately exact:
+      - Today's Schedule
+      - 3-Day Schedule
+      - 2-Week Schedule
+
+    Older scheduler versions created pages named "Today" and "Next Few Weeks".
+    We do not create those names anymore.  If a canonical page does not exist,
+    create it; otherwise update the existing canonical page.
+    """
     for page in pages:
         if title_value(page, "Name").strip() == name:
             return page
 
-    # Migrate the old single-page status to the new Today page instead of
-    # leaving a stale "Current Schedule" page behind.
-    if name == "Today":
+    # Migrate an old page only when the canonical destination does not already
+    # exist.  This avoids creating duplicate status pages on every run.
+    legacy_names = {
+        "Today's Schedule": ["Today", "Current Schedule"],
+        "2-Week Schedule": ["Next Few Weeks"],
+    }
+    for legacy_name in legacy_names.get(name, []):
         for page in pages:
-            if title_value(page, "Name").strip() == "Current Schedule":
-                response = notion(
+            if title_value(page, "Name").strip() == legacy_name:
+                notion(
                     "PATCH",
                     f"pages/{page['id']}",
                     json={
                         "properties": {
                             "Name": {
-                                "title": [{"text": {"content": "Today"}}]
+                                "title": [{"text": {"content": name}}]
                             }
                         }
                     },
                 )
                 page["properties"]["Name"] = {
                     "type": "title",
-                    "title": [{"plain_text": "Today"}],
+                    "title": [{"plain_text": name}],
                 }
                 return page
 
@@ -3070,22 +3085,39 @@ def _find_or_create_schedule_status_page(pages, data_source_id, name):
     return response
 
 
-def _text_property(content):
-    return {"rich_text": [{"type": "text", "text": {"content": content}}]}
-
-
 def _update_status_page(page, property_names, status_info, mode):
     now = datetime.now(TZ)
+
     if mode == "today":
         status = "🟠 Needs attention" if status_info["today_extra"] > 0 else "🟢 On track"
         detail = status_info["today_extra"]
         required = status_info["today_required"]
         capacity = status_info["today_capacity"]
+        detail_text = (
+            f"{format_minutes(detail)} additional time needed"
+            if detail > 0
+            else "No additional time needed"
+        )
+    elif mode == "3day":
+        status = "🟠 Needs attention" if status_info["near_term_extra"] > 0 else "🟢 On track"
+        detail = status_info["near_term_extra"]
+        required = status_info["near_term_required"]
+        capacity = status_info["near_term_capacity"]
+        detail_text = (
+            f"{format_minutes(detail)} additional time needed"
+            if detail > 0
+            else "No additional time needed"
+        )
     else:
         status = "🟠 Needs attention" if status_info["additional_per_week"] > 0 else "🟢 On track"
-        detail = status_info["additional_per_week"] if status_info["additional_per_week"] > 0 else -status_info["weekly_surplus"]
+        detail = status_info["additional_per_week"]
         required = status_info["long_term_required"]
         capacity = status_info["long_term_capacity"]
+        detail_text = (
+            f"Add about {format_minutes(round(detail))}/week of Focus Time"
+            if detail > 0
+            else f"{format_minutes(round(status_info['weekly_surplus']))}/week available"
+        )
 
     properties = {
         property_names["status"]: {"select": {"name": status}},
@@ -3094,15 +3126,7 @@ def _update_status_page(page, property_names, status_info, mode):
             format_minutes(status_info["pfs_required"]) if status_info["pfs_active"] else "Inactive"
         ),
         property_names["capacity"]: _text_property(format_minutes(capacity)),
-        property_names["difference"]: _text_property(
-            (
-                f"+{format_minutes(abs(detail))} available"
-                if detail < 0
-                else f"-{format_minutes(detail)} needed"
-                if detail > 0
-                else "0 minutes"
-            )
-        ),
+        property_names["difference"]: _text_property(detail_text),
         property_names["updated"]: {"date": {"start": now.isoformat()}},
     }
     notion("PATCH", f"pages/{page['id']}", json={"properties": properties})
@@ -3128,18 +3152,38 @@ def update_schedule_status(
     if property_names is None:
         raise RuntimeError('Could not find any page in "Schedule Status" to resolve its properties.')
 
-    today_page = _find_or_create_schedule_status_page(pages, data_source_id, "Today")
-    long_term_page = _find_or_create_schedule_status_page(pages, data_source_id, "Next Few Weeks")
+    today_page = _find_or_create_schedule_status_page(
+        pages, data_source_id, "Today's Schedule"
+    )
+    three_day_page = _find_or_create_schedule_status_page(
+        pages, data_source_id, "3-Day Schedule"
+    )
+    two_week_page = _find_or_create_schedule_status_page(
+        pages, data_source_id, "2-Week Schedule"
+    )
 
     _update_status_page(today_page, property_names, status_info, "today")
-    _update_status_page(long_term_page, property_names, status_info, "long_term")
+    _update_status_page(three_day_page, property_names, status_info, "3day")
+    _update_status_page(two_week_page, property_names, status_info, "2week")
 
     reconsider_requested = checkbox_value(today_page, property_names["reconsider"])
 
     print("Schedule Status updated.")
-    print(f'  Today: {"OVERLOADED by " + format_minutes(status_info["today_extra"]) if status_info["today_extra"] else "covered by Focus Time"}')
-    print(f'  Next 3 days: {"needs " + format_minutes(status_info["near_term_extra"]) + " extra time" if status_info["near_term_extra"] else "covered by Focus Time"}')
-    print(f'  Long term: {"add " + format_minutes(round(status_info["additional_per_week"])) + "/week" if status_info["additional_per_week"] else "no recurring increase needed"}')
+    print(
+        f'  Today: {format_minutes(status_info["today_extra"])} extra time needed'
+        if status_info["today_extra"]
+        else "  Today: covered by Focus Time"
+    )
+    print(
+        f'  Next 3 days: {format_minutes(status_info["near_term_extra"])} extra time needed'
+        if status_info["near_term_extra"]
+        else "  Next 3 days: covered by Focus Time"
+    )
+    print(
+        f'  2-week sustainable capacity: add {format_minutes(round(status_info["additional_per_week"]))}/week'
+        if status_info["additional_per_week"]
+        else f'  2-week sustainable capacity: {format_minutes(round(status_info["weekly_surplus"]))}/week available'
+    )
 
     return {
         "status_info": status_info,
@@ -3147,9 +3191,9 @@ def update_schedule_status(
         "reconsider_requested": reconsider_requested,
         "reconsider_property": property_names["reconsider"],
         "today_page_id": today_page["id"],
-        "long_term_page_id": long_term_page["id"],
+        "three_day_page_id": three_day_page["id"],
+        "long_term_page_id": two_week_page["id"],
     }
-
 
 def clear_reconsider_request(
     page_id,
