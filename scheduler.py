@@ -2676,30 +2676,63 @@ def calculate_status(
     completed_pfs_minutes,
     held_ids,
 ):
-    """Calculate status using hard deadlines only for configured task types."""
+    """Calculate separate near-term and long-term schedule pressure.
+
+    The scheduler deliberately distinguishes three things:
+      1. TODAY: work that must be done today/overdue versus today's Focus Time.
+      2. NEAR TERM: cumulative work due in the next few days versus capacity
+         through that window. This is the short-term rescue number.
+      3. LONG TERM: sustainable recurring Focus Time needed for work after the
+         near-term window through the planning horizon. This deliberately
+         excludes near-term rescue work, so a large amount of work that all
+         needs to be done today does not masquerade as a permanent weekly
+         Focus Time requirement.
+
+    Focus Time is not a hard ceiling on required allocations. A deficit means
+    additional time is needed beyond the Focus Time blocks; it does not cause
+    required work to disappear.
+    """
     now = datetime.now(TZ)
+    today = now.date()
+    near_term_end = today + timedelta(days=2)  # today + next two days
+    horizon = now + timedelta(days=PLANNING_DAYS)
 
-    horizon = (
-        now
-        + timedelta(days=PLANNING_DAYS)
-    )
+    def block_capacity_between(start_dt, end_dt):
+        total = 0
+        for block in focus_blocks:
+            block_start = block["start"]
+            block_end = block["end"]
+            overlap_start = max(block_start, start_dt)
+            overlap_end = min(block_end, end_dt)
+            if overlap_end <= overlap_start:
+                continue
+            full_minutes = max(
+                0,
+                int((block_end - block_start).total_seconds() / 60),
+            )
+            overlap_minutes = max(
+                0,
+                int((overlap_end - overlap_start).total_seconds() / 60),
+            )
+            capacity = block.get("capacity", block.get("remaining", 0))
+            if full_minutes > 0:
+                total += min(capacity, int(capacity * overlap_minutes / full_minutes))
+        return total
 
-    # Status capacity must use immutable Focus Time capacity, not the
-    # mutable "remaining" counter consumed while building a schedule.
-    available = sum(
-        block.get("capacity", block["remaining"])
-        for block in focus_blocks
+    end_of_today = datetime.combine(
+        today,
+        datetime.max.time(),
+        tzinfo=TZ,
     )
-
-    daily_capacity = build_daily_capacity(focus_blocks)
-    ahead_reserve = int(
-        sum(daily_capacity.values())
-        * AHEAD_CAPACITY_FRACTION
+    end_of_near_term = datetime.combine(
+        near_term_end,
+        datetime.max.time(),
+        tzinfo=TZ,
     )
+    today_capacity = block_capacity_between(now, end_of_today)
+    near_term_capacity = block_capacity_between(now, end_of_near_term)
 
     remaining = {}
-
-    total_remaining = 0
     held_minutes = 0
     completed_minutes_total = 0
     undated_minutes = 0
@@ -2708,24 +2741,13 @@ def calculate_status(
         original_minutes = task["minutes"]
         completed_minutes = min(
             original_minutes,
-            completed.get(
-                task["page_id"],
-                0,
-            ),
+            completed.get(task["page_id"], 0),
         )
-
         completed_minutes_total += completed_minutes
 
-        rem = max(
-            0,
-            original_minutes
-            - completed_minutes,
-        )
+        rem = max(0, original_minutes - completed_minutes)
 
-        if task["completed"]:
-            continue
-
-        if task["task"] == PFS_TASK_NAME:
+        if task["completed"] or task["task"] == PFS_TASK_NAME:
             continue
 
         if task["page_id"] in held_ids:
@@ -2736,39 +2758,20 @@ def calculate_status(
             continue
 
         remaining[task["page_id"]] = rem
-        total_remaining += rem
-
         if task.get("deadline") is None:
             undated_minutes += rem
 
-    tasks_by_id, dependents = (
-        build_dependency_graph(tasks)
-    )
+    tasks_by_id, dependents = build_dependency_graph(tasks)
 
     required_by = {}
-
     for task in tasks:
-        if task["completed"]:
+        if task["completed"] or task["task"] == PFS_TASK_NAME:
             continue
-
-        if task["task"] == PFS_TASK_NAME:
+        if task["page_id"] in held_ids or task["priority"] == "Low":
             continue
-
-        if task["page_id"] in held_ids:
-            continue
-
-        if task["priority"] == "Low":
-            continue
-
-        # Only school/application/test work creates a hard
-        # before-deadline capacity requirement. Deadlines on work,
-        # personal, and other flexible tasks remain soft scheduling
-        # preferences and do not create a deficit.
         if task["database"] not in HARD_DEADLINE_DATABASES:
             continue
-
         deadline = actual_deadline_end(task)
-
         if deadline is not None:
             required_by[task["page_id"]] = deadline
 
@@ -2777,132 +2780,126 @@ def calculate_status(
     def solve_required_by(task_id):
         if task_id in visiting:
             raise RuntimeError(
-                "Circular dependency detected "
-                "while calculating status."
+                "Circular dependency detected while calculating status."
             )
-
         visiting.add(task_id)
-
-        for dependent_id in dependents.get(
-            task_id,
-            [],
-        ):
+        for dependent_id in dependents.get(task_id, []):
             if dependent_id in held_ids:
                 continue
-
             solve_required_by(dependent_id)
-
             dependent = tasks_by_id[dependent_id]
-            dependent_remaining = remaining.get(
-                dependent_id,
-                0,
-            )
-
-            if (
-                dependent["completed"]
-                or dependent_remaining <= 0
-            ):
+            dependent_remaining = remaining.get(dependent_id, 0)
+            if dependent["completed"] or dependent_remaining <= 0:
                 continue
-
-            downstream = required_by.get(
-                dependent_id
-            )
-
+            downstream = required_by.get(dependent_id)
             if downstream is None:
                 continue
-
-            candidate = (
-                downstream
-                - timedelta(
-                    minutes=dependent_remaining
-                )
-                - timedelta(days=1)
-            )
-
+            candidate = downstream - timedelta(minutes=dependent_remaining) - timedelta(days=1)
             own = required_by.get(task_id)
-
-            if (
-                own is None
-                or candidate < own
-            ):
+            if own is None or candidate < own:
                 required_by[task_id] = candidate
-
         visiting.remove(task_id)
 
     for task in tasks:
         solve_required_by(task["page_id"])
 
     deadline_tasks = []
-
     for task_id, deadline in required_by.items():
-        if task_id not in remaining:
+        if task_id not in remaining or deadline > horizon:
             continue
+        deadline_tasks.append((deadline, remaining[task_id], tasks_by_id[task_id]))
+    deadline_tasks.sort(key=lambda item: item[0])
 
-        if deadline > horizon:
-            continue
-
-        deadline_tasks.append(
-            (
-                deadline,
-                remaining[task_id],
-                tasks_by_id[task_id],
-            )
+    def required_through(end_date):
+        return sum(
+            rem for deadline, rem, _ in deadline_tasks
+            if deadline.date() <= end_date
         )
 
-    deadline_tasks.sort(
-        key=lambda item: item[0]
-    )
+    today_required = required_through(today)
+    near_term_required = required_through(near_term_end)
 
-    cumulative_required = 0
+    today_extra = max(0, today_required - today_capacity)
+    near_term_extra = max(0, near_term_required - near_term_capacity)
+
+    # Long-term capacity is intentionally calculated only from work AFTER the
+    # near-term rescue window. This answers the user's real planning question:
+    # "Do I need to add Focus Time to my normal schedule?" rather than
+    # "How much emergency time do I need today?"
+    long_term_start = near_term_end + timedelta(days=1)
+    long_term_required = sum(
+        rem for deadline, rem, _ in deadline_tasks
+        if long_term_start <= deadline.date() <= horizon.date()
+    )
+    long_term_start_dt = datetime.combine(
+        long_term_start,
+        datetime.min.time(),
+        tzinfo=TZ,
+    )
+    long_term_capacity = block_capacity_between(long_term_start_dt, horizon)
+    long_term_days = max(1, (horizon.date() - long_term_start).days + 1)
+    long_term_weeks = max(1 / 7, long_term_days / 7)
+
+    required_per_week = long_term_required / long_term_weeks
+    capacity_per_week = long_term_capacity / long_term_weeks
+    additional_per_week = max(0, required_per_week - capacity_per_week)
+    weekly_surplus = max(0, capacity_per_week - required_per_week)
+
+    # Overall status is driven by near-term pressure first, then by whether
+    # the sustainable long-term schedule needs additional recurring Focus Time.
+    if today_extra > 0:
+        status = "🔴 Today overloaded"
+        status_detail = (
+            "🔴 Today requires "
+            f"{format_minutes(today_extra)} additional time beyond Focus Time"
+        )
+        difference = -today_extra
+    elif near_term_extra > 0:
+        status = "🟠 Near-term pressure"
+        status_detail = (
+            "🟠 Next three days require "
+            f"{format_minutes(near_term_extra)} additional time beyond Focus Time"
+        )
+        difference = -near_term_extra
+    elif additional_per_week > 0:
+        status = "🟡 Add recurring Focus Time"
+        status_detail = (
+            "🟡 Long-term workload requires about "
+            f"{format_minutes(round(additional_per_week))} additional Focus Time per week"
+        )
+        difference = -round(additional_per_week)
+    else:
+        status = "🟢 On track"
+        status_detail = (
+            "🟢 No additional recurring Focus Time is required by the current "
+            f"{PLANNING_DAYS}-day hard-deadline workload"
+        )
+        difference = round(weekly_surplus)
+
+    bottleneck = None
     worst_shortfall = 0
     worst_slack = None
     deficit_task_ids = set()
+    cumulative_required = 0
 
     for index, (deadline, rem, task) in enumerate(deadline_tasks):
         cumulative_required += rem
-
         capacity_through_deadline = 0
-
         for block in focus_blocks:
             if block["start"] >= deadline:
                 continue
-
-            usable_end = min(
-                block["end"],
-                deadline,
-            )
-
+            usable_end = min(block["end"], deadline)
             block_minutes = max(
                 0,
-                int(
-                    (
-                        usable_end
-                        - block["start"]
-                    ).total_seconds()
-                    / 60
-                ),
+                int((usable_end - block["start"]).total_seconds() / 60),
             )
-
-            # Use actual Focus Time capacity here. The scheduler
-            # mutates "remaining" while constructing allocations; that
-            # must not make the status diagnostic report a permanent
-            # artificial deficit.
             capacity_through_deadline += min(
-                block.get("capacity", block["remaining"]),
+                block.get("capacity", block.get("remaining", 0)),
                 block_minutes,
             )
-
-        slack = (
-            capacity_through_deadline
-            - cumulative_required
-        )
-
-        if (
-            worst_slack is None
-            or slack < worst_slack
-        ):
+        slack = capacity_through_deadline - cumulative_required
+        if worst_slack is None or slack < worst_slack:
             worst_slack = slack
-
         if slack < 0 and abs(slack) > worst_shortfall:
             worst_shortfall = abs(slack)
             bottleneck = {
@@ -2913,194 +2910,202 @@ def calculate_status(
                 "task": task,
             }
             deficit_task_ids = {
-                item[2]["page_id"]
-                for item in deadline_tasks[: index + 1]
+                item[2]["page_id"] for item in deadline_tasks[: index + 1]
             }
 
-    # Held work is intentionally excluded from the active deadline
-    # shortfall because it cannot currently be scheduled. However, expose
-    # its deadline pressure explicitly so a large derived hold is not hidden
-    # inside the aggregate "On Hold work excluded" number.
     held_deadline_tasks = []
-
     for task in tasks:
-        if task["completed"]:
+        if task["completed"] or task["task"] == PFS_TASK_NAME:
             continue
-
-        if task["task"] == PFS_TASK_NAME:
+        if task["page_id"] not in held_ids or task["priority"] == "Low":
             continue
-
-        if task["page_id"] not in held_ids:
-            continue
-
-        if task["priority"] == "Low":
-            continue
-
         deadline = actual_deadline_end(task)
-        rem = max(
-            0,
-            task["minutes"]
-            - min(
-                task["minutes"],
-                completed.get(task["page_id"], 0),
-            ),
-        )
-
+        rem = max(0, task["minutes"] - min(task["minutes"], completed.get(task["page_id"], 0)))
         if deadline is not None and rem > 0 and deadline <= horizon:
-            held_deadline_tasks.append(
-                (deadline, rem, task)
-            )
+            held_deadline_tasks.append((deadline, rem, task))
+    held_deadline_tasks.sort(key=lambda item: item[0])
 
-    held_deadline_tasks.sort(
-        key=lambda item: item[0]
-    )
-
-    # A bottleneck is a genuinely blocking task: an unfinished, active
-    # prerequisite for at least one other unfinished, unheld task. This is
-    # deliberately separate from deadline pressure and scheduling deficit.
     bottleneck_task_ids = set()
-
     for task in tasks:
         task_id = task["page_id"]
-
         if task["completed"] or task_id in held_ids:
             continue
-
         active_dependents = [
-            dependent_id
-            for dependent_id in dependents.get(task_id, set())
-            if (
-                not tasks_by_id[dependent_id]["completed"]
-                and dependent_id not in held_ids
-            )
+            dependent_id for dependent_id in dependents.get(task_id, set())
+            if not tasks_by_id[dependent_id]["completed"] and dependent_id not in held_ids
         ]
-
         if active_dependents:
             bottleneck_task_ids.add(task_id)
 
     pfs_active = any(
-        task["task"] == PFS_TASK_NAME
-        and not task["completed"]
+        task["task"] == PFS_TASK_NAME and not task["completed"]
         for task in tasks
     )
-
-    pfs_required = 0
-
-    if pfs_active:
-        pfs_required = max(
-            0,
-            PFS_WEEKLY_TARGET_MINUTES
-            - completed_pfs_minutes,
-        )
-
-    if worst_shortfall > 0:
-        status = "🟠 Needs attention"
-        status_detail = (
-            "🟠 Needs attention — "
-            f"{format_minutes(worst_shortfall)} "
-            "additional Focus Time needed "
-            "to meet an actual "
-            "High/Medium-priority deadline"
-        )
-        difference = -worst_shortfall
-    else:
-        status = "🟢 On track"
-
-        if worst_slack is None:
-            difference = available
-            status_detail = (
-                "🟢 On track — no hard "
-                "actual deadlines currently "
-                "require additional Focus Time"
-            )
-        else:
-            difference = worst_slack
-            status_detail = (
-                "🟢 On track — minimum "
-                "hard-deadline slack is "
-                f"{format_minutes(worst_slack)}"
-            )
+    pfs_required = max(0, PFS_WEEKLY_TARGET_MINUTES - completed_pfs_minutes) if pfs_active else 0
 
     print()
     print("Schedule diagnostic:")
-    print(
-        f"  Focus Time available: "
-        f"{format_minutes(available)}"
-    )
-    print(
-        f"  Ahead-of-deadline reserve: "
-        f"{format_minutes(ahead_reserve)}"
-    )
-    print(
-        f"  Active remaining work: "
-        f"{format_minutes(total_remaining)}"
-    )
-    print(
-        f"  Completed work credited: "
-        f"{format_minutes(completed_minutes_total)}"
-    )
-    print(
-        f"  On Hold work excluded: "
-        f"{format_minutes(held_minutes)}"
-    )
-    print(
-        f"  Undated/backlog work: "
-        f"{format_minutes(undated_minutes)}"
-    )
-    print(
-        f"  Deadline-constrained work: "
-        f"{format_minutes(sum(rem for _, rem, _ in deadline_tasks))}"
-    )
+    print(f"  Focus Time available today: {format_minutes(today_capacity)}")
+    print(f"  Work due today/overdue: {format_minutes(today_required)}")
+    print(f"  Extra time needed today: {format_minutes(today_extra)}")
+    print(f"  Focus Time available next 3 days: {format_minutes(near_term_capacity)}")
+    print(f"  Work due next 3 days: {format_minutes(near_term_required)}")
+    print(f"  Extra time needed next 3 days: {format_minutes(near_term_extra)}")
+    print(f"  Long-term work after near-term window: {format_minutes(long_term_required)}")
+    print(f"  Long-term Focus Time capacity: {format_minutes(long_term_capacity)}")
+    print(f"  Sustainable Focus Time needed/week: {format_minutes(round(required_per_week))}")
+    print(f"  Sustainable Focus Time available/week: {format_minutes(round(capacity_per_week))}")
+    if additional_per_week > 0:
+        print(f"  Additional recurring Focus Time needed/week: {format_minutes(round(additional_per_week))}")
+    else:
+        print(f"  Long-term weekly surplus: {format_minutes(round(weekly_surplus))}")
 
-    print(
-        f"  Held deadline work excluded from shortfall: "
-        f"{format_minutes(sum(rem for _, rem, _ in held_deadline_tasks))}"
-    )
-
-    for deadline, rem, task in held_deadline_tasks:
-        print(
-            f'    Held: "{task["task"]}" — '
-            f'{format_minutes(rem)} remaining, deadline '
-            f'{deadline.strftime("%Y-%m-%d %I:%M %p")}'
-        )
+    if held_deadline_tasks:
+        print(f"  Held deadline work excluded from active capacity: {format_minutes(sum(rem for _, rem, _ in held_deadline_tasks))}")
+        for deadline, rem, task in held_deadline_tasks:
+            print(
+                f'    Held: "{task["task"]}" — {format_minutes(rem)} remaining, '
+                f'deadline {deadline.strftime("%Y-%m-%d %I:%M %p")}'
+            )
 
     if bottleneck:
-        print("  Bottleneck deadline:")
-        print(
-            f'    Task: "{bottleneck["task"]["task"]}"'
-        )
-        print(
-            "    Deadline: "
-            f'{bottleneck["deadline"].strftime("%Y-%m-%d %I:%M %p")}'
-        )
-        print(
-            "    Required by deadline: "
-            f'{format_minutes(bottleneck["required"])}'
-        )
-        print(
-            "    Focus Time available: "
-            f'{format_minutes(bottleneck["available"])}'
-        )
-        print(
-            "    Shortfall: "
-            f'{format_minutes(bottleneck["shortfall"])}'
-        )
+        print("  Tightest hard deadline:")
+        print(f'    Task: "{bottleneck["task"]["task"]}"')
+        print(f'    Deadline: {bottleneck["deadline"].strftime("%Y-%m-%d %I:%M %p")}')
+        print(f'    Required by deadline: {format_minutes(bottleneck["required"])}')
+        print(f'    Focus Time available: {format_minutes(bottleneck["available"])}')
+        print(f'    Shortfall at that deadline: {format_minutes(bottleneck["shortfall"])}')
 
     return {
         "status": status,
         "status_detail": status_detail,
-        "available": available,
-        "ahead_reserve": ahead_reserve,
-        "deadline_required": sum(
-            rem for _, rem, _ in deadline_tasks
-        ),
+        "available": today_capacity,
+        "today_capacity": today_capacity,
+        "today_required": today_required,
+        "today_extra": today_extra,
+        "near_term_capacity": near_term_capacity,
+        "near_term_required": near_term_required,
+        "near_term_extra": near_term_extra,
+        "long_term_required": long_term_required,
+        "long_term_capacity": long_term_capacity,
+        "required_per_week": required_per_week,
+        "capacity_per_week": capacity_per_week,
+        "additional_per_week": additional_per_week,
+        "weekly_surplus": weekly_surplus,
+        "deadline_required": near_term_required,
         "pfs_required": pfs_required,
         "undated_minutes": undated_minutes,
         "difference": difference,
         "pfs_active": pfs_active,
         "bottleneck_task_ids": sorted(bottleneck_task_ids),
         "deficit_task_ids": sorted(deficit_task_ids),
+        "held_deadline_tasks": held_deadline_tasks,
     }
+
+
+def _schedule_status_page_properties(page):
+    """Resolve the existing Schedule Status properties by normalized name."""
+    actual_property_names = set(page.get("properties", {}).keys())
+
+    def resolve_property(expected_name):
+        if expected_name in actual_property_names:
+            return expected_name
+        normalized = "".join(c.lower() for c in expected_name if c.isalnum())
+        for actual_name in actual_property_names:
+            actual_normalized = "".join(c.lower() for c in actual_name if c.isalnum())
+            if actual_normalized == normalized:
+                return actual_name
+        raise RuntimeError(f'Could not find Schedule Status property "{expected_name}".')
+
+    return {
+        "status": resolve_property("Status"),
+        "deadline": resolve_property("Near-Term Deadline Work"),
+        "pfs": resolve_property("PFS Weekly Target Remaining"),
+        "capacity": resolve_property("Schedule Capacity"),
+        "difference": resolve_property("Schedule difference"),
+        "updated": resolve_property("Last Updated"),
+        "reconsider": resolve_property("Reconsider"),
+    }
+
+
+def _find_or_create_schedule_status_page(pages, data_source_id, name):
+    for page in pages:
+        if title_value(page, "Name").strip() == name:
+            return page
+
+    # Migrate the old single-page status to the new Today page instead of
+    # leaving a stale "Current Schedule" page behind.
+    if name == "Today":
+        for page in pages:
+            if title_value(page, "Name").strip() == "Current Schedule":
+                response = notion(
+                    "PATCH",
+                    f"pages/{page['id']}",
+                    json={
+                        "properties": {
+                            "Name": {
+                                "title": [{"text": {"content": "Today"}}]
+                            }
+                        }
+                    },
+                )
+                page["properties"]["Name"] = {
+                    "type": "title",
+                    "title": [{"plain_text": "Today"}],
+                }
+                return page
+
+    response = notion(
+        "POST",
+        "pages",
+        json={
+            "parent": {"data_source_id": data_source_id},
+            "properties": {
+                "Name": {
+                    "title": [{"text": {"content": name}}]
+                }
+            },
+        },
+    )
+    return response
+
+
+def _text_property(content):
+    return {"rich_text": [{"type": "text", "text": {"content": content}}]}
+
+
+def _update_status_page(page, property_names, status_info, mode):
+    now = datetime.now(TZ)
+    if mode == "today":
+        status = "🟠 Needs attention" if status_info["today_extra"] > 0 else "🟢 On track"
+        detail = status_info["today_extra"]
+        required = status_info["today_required"]
+        capacity = status_info["today_capacity"]
+    else:
+        status = "🟠 Needs attention" if status_info["additional_per_week"] > 0 else "🟢 On track"
+        detail = status_info["additional_per_week"] if status_info["additional_per_week"] > 0 else -status_info["weekly_surplus"]
+        required = status_info["long_term_required"]
+        capacity = status_info["long_term_capacity"]
+
+    properties = {
+        property_names["status"]: {"select": {"name": status}},
+        property_names["deadline"]: _text_property(format_minutes(required)),
+        property_names["pfs"]: _text_property(
+            format_minutes(status_info["pfs_required"]) if status_info["pfs_active"] else "Inactive"
+        ),
+        property_names["capacity"]: _text_property(format_minutes(capacity)),
+        property_names["difference"]: _text_property(
+            (
+                f"+{format_minutes(abs(detail))} available"
+                if detail < 0
+                else f"-{format_minutes(detail)} needed"
+                if detail > 0
+                else "0 minutes"
+            )
+        ),
+        property_names["updated"]: {"date": {"start": now.isoformat()}},
+    }
+    notion("PATCH", f"pages/{page['id']}", json={"properties": properties})
 
 
 def update_schedule_status(
@@ -3112,236 +3117,37 @@ def update_schedule_status(
     held_ids,
 ):
     status_info = calculate_status(
-        tasks,
-        completed,
-        focus_blocks,
-        completed_pfs_minutes,
-        held_ids,
+        tasks, completed, focus_blocks, completed_pfs_minutes, held_ids
     )
 
-    database_id = find_database(
-        "Schedule Status"
-    )
+    database_id = find_database("Schedule Status")
+    data_source_id = get_data_source(database_id)
+    pages = query_data_source(data_source_id)
 
-    data_source_id = get_data_source(
-        database_id
-    )
+    property_names = _schedule_status_page_properties(pages[0]) if pages else None
+    if property_names is None:
+        raise RuntimeError('Could not find any page in "Schedule Status" to resolve its properties.')
 
-    pages = query_data_source(
-        data_source_id
-    )
+    today_page = _find_or_create_schedule_status_page(pages, data_source_id, "Today")
+    long_term_page = _find_or_create_schedule_status_page(pages, data_source_id, "Next Few Weeks")
 
-    current_schedule_page = None
+    _update_status_page(today_page, property_names, status_info, "today")
+    _update_status_page(long_term_page, property_names, status_info, "long_term")
 
-    for page in pages:
+    reconsider_requested = checkbox_value(today_page, property_names["reconsider"])
 
-        if (
-            title_value(
-                page,
-                "Name",
-            ).strip()
-            == "Current Schedule"
-        ):
-            current_schedule_page = page
-            break
-
-    if not current_schedule_page:
-        raise RuntimeError(
-            'Could not find the '
-            '"Current Schedule" page in '
-            '"Schedule Status".'
-        )
-
-    actual_property_names = set(
-        current_schedule_page
-        .get("properties", {})
-        .keys()
-    )
-
-    def resolve_property(
-        expected_name
-    ):
-        if expected_name in (
-            actual_property_names
-        ):
-            return expected_name
-
-        def normalize(name):
-            return "".join(
-                character.lower()
-                for character in name
-                if character.isalnum()
-            )
-
-        expected_normalized = normalize(
-            expected_name
-        )
-
-        for actual_name in (
-            actual_property_names
-        ):
-
-            if (
-                normalize(actual_name)
-                == expected_normalized
-            ):
-                return actual_name
-
-        raise RuntimeError(
-            f'Could not find Schedule Status '
-            f'property "{expected_name}".'
-        )
-
-    status_property = resolve_property(
-        "Status"
-    )
-
-    deadline_property = resolve_property(
-        "Near-Term Deadline Work"
-    )
-
-    pfs_property = resolve_property(
-        "PFS Weekly Target Remaining"
-    )
-
-    capacity_property = resolve_property(
-        "Schedule Capacity"
-    )
-
-    difference_property = resolve_property(
-        "Schedule difference"
-    )
-
-    updated_property = resolve_property(
-        "Last Updated"
-    )
-
-    reconsider_property = resolve_property(
-        "Reconsider"
-    )
-
-    reconsider_requested = checkbox_value(
-        current_schedule_page,
-        reconsider_property,
-    )
-
-    now = datetime.now(TZ)
-
-    properties = {
-        status_property: {
-            "select": {
-                "name":
-                    status_info["status"]
-            }
-        },
-
-        deadline_property: {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content":
-                            format_minutes(
-                                status_info[
-                                    "deadline_required"
-                                ]
-                            )
-                    },
-                }
-            ]
-        },
-
-        pfs_property: {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content": (
-                            format_minutes(
-                                status_info[
-                                    "pfs_required"
-                                ]
-                            )
-                            if
-                            status_info[
-                                "pfs_active"
-                            ]
-                            else
-                            "Inactive"
-                        )
-                    },
-                }
-            ]
-        },
-
-        capacity_property: {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content":
-                            format_minutes(
-                                status_info[
-                                    "available"
-                                ]
-                            )
-                    },
-                }
-            ]
-        },
-
-        difference_property: {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content": (
-                            f"+{format_minutes(status_info['difference'])} surplus"
-                            if
-                            status_info[
-                                "difference"
-                            ] >= 0
-                            else
-                            f"-{format_minutes(abs(status_info['difference']))} needed"
-                        )
-                    },
-                }
-            ]
-        },
-
-        updated_property: {
-            "date": {
-                "start":
-                    now.isoformat()
-            }
-        },
-    }
-
-    notion(
-        "PATCH",
-        f"pages/{current_schedule_page['id']}",
-        json={
-            "properties":
-                properties
-        },
-    )
-
-    print(
-        "Schedule Status updated."
-    )
-
-    print(
-        f"  {status_info['status_detail']}"
-    )
+    print("Schedule Status updated.")
+    print(f'  Today: {"OVERLOADED by " + format_minutes(status_info["today_extra"]) if status_info["today_extra"] else "covered by Focus Time"}')
+    print(f'  Next 3 days: {"needs " + format_minutes(status_info["near_term_extra"]) + " extra time" if status_info["near_term_extra"] else "covered by Focus Time"}')
+    print(f'  Long term: {"add " + format_minutes(round(status_info["additional_per_week"])) + "/week" if status_info["additional_per_week"] else "no recurring increase needed"}')
 
     return {
         "status_info": status_info,
-        "page_id":
-            current_schedule_page["id"],
-        "reconsider_requested":
-            reconsider_requested,
-        "reconsider_property":
-            reconsider_property,
+        "page_id": today_page["id"],
+        "reconsider_requested": reconsider_requested,
+        "reconsider_property": property_names["reconsider"],
+        "today_page_id": today_page["id"],
+        "long_term_page_id": long_term_page["id"],
     }
 
 
