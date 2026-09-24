@@ -2028,92 +2028,45 @@ def assign_schedule_order(
     new_allocations,
     now,
 ):
+    """Order allocations by urgency, then by the first Focus Time used.
+
+    The scheduler still decides the individual Focus Time distribution first.
+    Presentation is handled later by grouping allocations for the same task
+    and calendar day.
+    """
     def urgency_key(item):
-
         task = item["task"]
-
-        kind = deadline_day_kind(
-            task,
-            now,
-        )
+        kind = deadline_day_kind(task, now)
 
         priority_rank = {
             "High": 0,
             "Medium": 1,
             "Low": 3,
-        }.get(
-            task.get("priority"),
-            2,
-        )
+        }.get(task.get("priority"), 2)
 
-        if (
-            kind == "overdue"
-            and task.get("priority")
-            != "Low"
-        ):
+        if kind == "overdue" and task.get("priority") != "Low":
             tier = 0
-
-        elif (
-            kind == "today"
-            and task.get("priority")
-            != "Low"
-        ):
+        elif kind == "today" and task.get("priority") != "Low":
             tier = 1
-
         elif kind == "overdue":
             tier = 4
-
         elif kind == "today":
             tier = 5
-
         else:
             tier = 2
 
-        effective = task.get(
-            "effective_deadline"
-        )
+        effective = task.get("effective_deadline")
+        effective_key = effective.timestamp() if effective else float("inf")
+        block_key = item["focus_page_start"].timestamp()
 
-        effective_key = (
-            effective.timestamp()
-            if effective
-            else float("inf")
-        )
+        return (tier, priority_rank, effective_key, block_key, task["task"].lower())
 
-        block_key = (
-            item["focus_page_start"]
-            .timestamp()
-        )
+    ordered = sorted(new_allocations, key=urgency_key)
 
-        return (
-            tier,
-            priority_rank,
-            effective_key,
-            block_key,
-            task["task"].lower(),
-        )
-
-    ordered = sorted(
-        new_allocations,
-        key=urgency_key,
-    )
-
-    for order, allocation in enumerate(
-        ordered,
-        start=1,
-    ):
-
-        allocation[
-            "schedule_order"
-        ] = order
-
-        allocation[
-            "overdue"
-        ] = (
-            deadline_day_kind(
-                allocation["task"],
-                now,
-            )
-            == "overdue"
+    for order, allocation in enumerate(ordered, start=1):
+        allocation["schedule_order"] = order
+        allocation["overdue"] = (
+            deadline_day_kind(allocation["task"], now) == "overdue"
         )
 
 
@@ -2293,11 +2246,11 @@ def create_allocation(
 
         "Focus time": {
             "relation": [
-                {
-                    "id": allocation[
-                        "focus_page_id"
-                    ]
-                }
+                {"id": focus_id}
+                for focus_id in allocation.get(
+                    "focus_page_ids",
+                    [allocation["focus_page_id"]],
+                )
             ]
         },
 
@@ -2633,8 +2586,10 @@ def calculate_status(
         + timedelta(days=PLANNING_DAYS)
     )
 
+    # Status capacity must use immutable Focus Time capacity, not the
+    # mutable "remaining" counter consumed while building a schedule.
     available = sum(
-        block["remaining"]
+        block.get("capacity", block["remaining"])
         for block in focus_blocks
     )
 
@@ -2677,6 +2632,7 @@ def calculate_status(
             continue
 
         remaining[task["page_id"]] = rem
+        total_remaining += rem
 
         if task.get("deadline") is None:
             undated_minutes += rem
@@ -2823,8 +2779,12 @@ def calculate_status(
                 ),
             )
 
+            # Use actual Focus Time capacity here. The scheduler
+            # mutates "remaining" while constructing allocations; that
+            # must not make the status diagnostic report a permanent
+            # artificial deficit.
             capacity_through_deadline += min(
-                block["remaining"],
+                block.get("capacity", block["remaining"]),
                 block_minutes,
             )
 
@@ -3544,7 +3504,15 @@ def update_allocation_page(
         "Name": {"title": [{"text": {"content": f'{task["task"]} — {display_amount}'}}]},
         "Schedule Order": {"number": desired.get("schedule_order", 0)},
         "Overdue": {"checkbox": desired.get("overdue", False)},
-        "Focus time": {"relation": [{"id": desired["focus_page_id"]}]},
+        "Focus time": {
+            "relation": [
+                {"id": focus_id}
+                for focus_id in desired.get(
+                    "focus_page_ids",
+                    [desired["focus_page_id"]],
+                )
+            ]
+        },
         "Allocation": {"number": minutes_to_units(desired["amount_minutes"], unit)},
         "Unit": {"select": {"name": unit}},
     }
@@ -3556,16 +3524,40 @@ def reconcile_allocations(
     existing_allocations,
     desired_allocations,
     tasks_by_id,
+    all_focus_blocks=None,
 ):
-    """Update reusable allocations in place; remove only obsolete ones."""
-    desired_by_key = {}
+    """Reconcile one displayed allocation per task per calendar day.
+
+    Scheduling is still performed at the Focus Time/block level. This function
+    only groups those already-decided segments for presentation in Notion.
+    Completed and held pages are never reused or overwritten.
+    """
+    def desired_day(item):
+        return item["focus_page_start"].date()
+
+    # Group the scheduler's block-level decisions by task + calendar day.
+    grouped_desired = {}
     for desired in desired_allocations:
         key = (
             normalize_notion_id(desired["task"]["page_id"]),
-            normalize_notion_id(desired["focus_page_id"]),
+            desired_day(desired),
         )
-        desired_by_key[key] = desired
+        group = grouped_desired.setdefault(key, [])
+        group.append(desired)
 
+    desired_groups = []
+    for items in grouped_desired.values():
+        items.sort(key=lambda item: item["focus_page_start"])
+        first = dict(items[0])
+        first["focus_page_ids"] = [item["focus_page_id"] for item in items]
+        first["focus_page_id"] = first["focus_page_ids"][0]
+        first["amount_minutes"] = sum(item["amount_minutes"] for item in items)
+        first["schedule_order"] = min(item.get("schedule_order", 0) for item in items)
+        first["overdue"] = any(item.get("overdue", False) for item in items)
+        desired_groups.append(first)
+
+    # Existing active pages are reusable by task + day. Their Focus Time
+    # relation is replaced with all of the blocks used by that day's group.
     reusable = {}
     for allocation in existing_allocations:
         if allocation["completed"] or allocation["hold"]:
@@ -3574,13 +3566,27 @@ def reconcile_allocations(
         if not task_id:
             continue
         for focus_id in allocation["focus_ids"]:
-            key = (normalize_notion_id(task_id), normalize_notion_id(focus_id))
-            reusable.setdefault(key, []).append(allocation)
+            block = next(
+                (b for b in (all_focus_blocks or []) if normalize_notion_id(b["page_id"]) == normalize_notion_id(focus_id)),
+                None,
+            )
+            if block:
+                key = (normalize_notion_id(task_id), block["start"].date())
+                reusable.setdefault(key, []).append(allocation)
+                break
 
     used = set()
     to_create = []
-    for key, desired in desired_by_key.items():
-        existing = next((a for a in reusable.get(key, []) if a["page_id"] not in used), None)
+
+    for desired in sorted(desired_groups, key=lambda item: (item["schedule_order"], item["focus_page_start"])):
+        key = (
+            normalize_notion_id(desired["task"]["page_id"]),
+            desired_day(desired),
+        )
+        existing = next(
+            (a for a in reusable.get(key, []) if a["page_id"] not in used),
+            None,
+        )
         if existing:
             update_allocation_page(existing, desired)
             used.add(existing["page_id"])
@@ -3702,6 +3708,7 @@ def rebuild(
         allocations,
         new_allocations,
         tasks_by_id,
+        all_focus_blocks,
     )
 
     # Read the database again so the newly
@@ -3856,6 +3863,11 @@ def main():
                 tasks_by_id,
             ),
         "derived_hold_allocation_ids": sorted(derived_hold_allocation_ids),
+        "completed_allocation_ids": sorted(
+            allocation["page_id"]
+            for allocation in allocations
+            if allocation["completed"]
+        ),
     }
 
     force_rebuild = (
@@ -3880,6 +3892,8 @@ def main():
 
         "derived_hold_allocation_ids":
             state.get("derived_hold_allocation_ids", []),
+        "completed_allocation_ids":
+            state.get("completed_allocation_ids", []),
     }
 
     changed = (
@@ -3947,6 +3961,24 @@ def main():
     # the scheduler rebuilds the remaining
     # schedule immediately.
 
+    # A completed allocation is a real scheduling input change. On the next
+    # rebuild, the completed work is credited and the newly freed Focus Time
+    # is available to the normal scheduler, so another eligible task can move
+    # into that space immediately.
+    completed_allocation_ids = {
+        allocation["page_id"]
+        for allocation in allocations
+        if allocation["completed"]
+    }
+    previous_completed_allocation_ids = set(
+        state.get("completed_allocation_ids", [])
+    )
+    newly_completed = completed_allocation_ids - previous_completed_allocation_ids
+    if newly_completed:
+        print(
+            f"Early/completed allocation change detected: {len(newly_completed)} allocation(s)."
+        )
+
     rebuild_result = rebuild(
         tasks,
         all_focus_blocks,
@@ -3962,6 +3994,9 @@ def main():
             rebuild_result["allocations"],
             tasks_by_id,
         )
+    )
+    current_inputs["completed_allocation_ids"] = sorted(
+        completed_allocation_ids
     )
 
     save_state(
