@@ -3751,7 +3751,12 @@ def reconcile_allocations(
         if not task_id:
             continue
 
-        plan_date = allocation.get("plan_date")
+        plan_date_value = allocation.get("plan_date")
+        if isinstance(plan_date_value, dict):
+            plan_date = plan_date_value.get("start")
+        else:
+            plan_date = plan_date_value
+
         if plan_date:
             key = (normalize_notion_id(task_id), plan_date.date())
             reusable.setdefault(key, []).append(allocation)
