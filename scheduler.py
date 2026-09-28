@@ -310,63 +310,70 @@ def get_data_source(database_id):
     return sources[0]["id"]
 
 
-def ensure_number_property(database_id, property_name):
-    """Create a number property on a database if it does not already exist."""
-    schema = notion(
+def ensure_database_property(database_id, property_name, property_type, config):
+    """Ensure a property exists on the database's current data source.
+
+    Notion's newer API versions expose database properties through data sources.
+    Updating only /databases/{id} can leave the property absent from the data
+    source that is actually used by page creation/update calls, which then
+    produces errors such as "Plan Date is not a property that exists".
+    """
+    database = notion(
         "GET",
         f"databases/{database_id}",
     )
 
-    properties = schema.get("properties", {})
-    if property_name in properties:
-        if properties[property_name].get("type") != "number":
+    properties = database.get("properties", {})
+    existing = properties.get(property_name)
+    if existing:
+        if existing.get("type") != property_type:
             raise RuntimeError(
-                f'The "{property_name}" property exists but is not a number property.'
+                f'The "{property_name}" property exists but is not a '
+                f'{property_type} property.'
             )
         return
 
-    print(f'Creating "{property_name}" property in database {database_id}.')
+    data_sources = database.get("data_sources", [])
+    if not data_sources:
+        raise RuntimeError(
+            f"No data source found for database {database_id} while creating "
+            f'"{property_name}".'
+        )
+
+    data_source_id = data_sources[0]["id"]
+    print(
+        f'Creating "{property_name}" {property_type} property in '
+        f'data source {data_source_id}.'
+    )
+
     notion(
         "PATCH",
-        f"databases/{database_id}",
+        f"data_sources/{data_source_id}",
         json={
             "properties": {
-                property_name: {
-                    "number": {
-                        "format": "number"
-                    }
-                }
+                property_name: config
             }
         },
+    )
+
+
+def ensure_number_property(database_id, property_name):
+    """Create a number property on a database if it does not already exist."""
+    ensure_database_property(
+        database_id,
+        property_name,
+        "number",
+        {"number": {"format": "number"}},
     )
 
 
 def ensure_date_property(database_id, property_name):
     """Create a date property on a database if it does not already exist."""
-    schema = notion(
-        "GET",
-        f"databases/{database_id}",
-    )
-
-    properties = schema.get("properties", {})
-    if property_name in properties:
-        if properties[property_name].get("type") != "date":
-            raise RuntimeError(
-                f'The "{property_name}" property exists but is not a date property.'
-            )
-        return
-
-    print(f'Creating "{property_name}" property in database {database_id}.')
-    notion(
-        "PATCH",
-        f"databases/{database_id}",
-        json={
-            "properties": {
-                property_name: {
-                    "date": {}
-                }
-            }
-        },
+    ensure_database_property(
+        database_id,
+        property_name,
+        "date",
+        {"date": {}},
     )
 
 
@@ -3632,9 +3639,9 @@ def reconcile_allocations(
         if not deadline:
             continue
 
-        plan_date = deadline.date()
-        if plan_date < now.date():
-            plan_date = now.date()
+        original_plan_date = deadline.date()
+        is_overdue = original_plan_date < now.date()
+        plan_date = now.date() if is_overdue else original_plan_date
 
         desired_groups.append({
             "task": task,
@@ -3644,7 +3651,7 @@ def reconcile_allocations(
             "focus_page_start": datetime.combine(plan_date, datetime.min.time(), tzinfo=TZ),
             "plan_date": plan_date,
             "schedule_order": 1000000,
-            "overdue": plan_date < now.date(),
+            "overdue": is_overdue,
         })
 
     # Existing active pages are reusable by task + Plan Date. This works for
