@@ -29,6 +29,8 @@ PREFERRED_MAX_CHUNK_MINUTES = 45
 AHEAD_CAPACITY_FRACTION = 0.20
 
 DEPENDENCY_PROPERTY_NAME = "Blocked by"
+COMPLETED_UNITS_PROPERTY_NAME = "Completed Units"
+PLAN_DATE_PROPERTY_NAME = "Plan Date"
 
 PFS_TASK_NAME = "PFS weekly hours"
 PFS_DATABASE_NAME = "PFS To-Do"
@@ -308,6 +310,66 @@ def get_data_source(database_id):
     return sources[0]["id"]
 
 
+def ensure_number_property(database_id, property_name):
+    """Create a number property on a database if it does not already exist."""
+    schema = notion(
+        "GET",
+        f"databases/{database_id}",
+    )
+
+    properties = schema.get("properties", {})
+    if property_name in properties:
+        if properties[property_name].get("type") != "number":
+            raise RuntimeError(
+                f'The "{property_name}" property exists but is not a number property.'
+            )
+        return
+
+    print(f'Creating "{property_name}" property in database {database_id}.')
+    notion(
+        "PATCH",
+        f"databases/{database_id}",
+        json={
+            "properties": {
+                property_name: {
+                    "number": {
+                        "format": "number"
+                    }
+                }
+            }
+        },
+    )
+
+
+def ensure_date_property(database_id, property_name):
+    """Create a date property on a database if it does not already exist."""
+    schema = notion(
+        "GET",
+        f"databases/{database_id}",
+    )
+
+    properties = schema.get("properties", {})
+    if property_name in properties:
+        if properties[property_name].get("type") != "date":
+            raise RuntimeError(
+                f'The "{property_name}" property exists but is not a date property.'
+            )
+        return
+
+    print(f'Creating "{property_name}" property in database {database_id}.')
+    notion(
+        "PATCH",
+        f"databases/{database_id}",
+        json={
+            "properties": {
+                property_name: {
+                    "date": {}
+                }
+            }
+        },
+    )
+
+
 def query_data_source(data_source_id):
     pages = []
     cursor = None
@@ -485,6 +547,11 @@ def read_tasks():
             database_name
         )
 
+        ensure_number_property(
+            database_id,
+            COMPLETED_UNITS_PROPERTY_NAME,
+        )
+
         data_source_id = get_data_source(
             database_id
         )
@@ -513,6 +580,17 @@ def read_tasks():
                 "Workload",
             )
 
+            completed_units = number_value(
+                page,
+                COMPLETED_UNITS_PROPERTY_NAME,
+            ) or 0
+
+            if workload is not None:
+                completed_units = max(
+                    0,
+                    min(completed_units, workload),
+                )
+
             unit = select_value(
                 page,
                 "Unit",
@@ -528,6 +606,7 @@ def read_tasks():
                     "Deadline",
                 ),
                 "workload": workload,
+                "completed_units": completed_units,
                 "unit": unit,
                 "priority": select_value(
                     page,
@@ -560,6 +639,27 @@ def read_tasks():
     )
 
     return tasks
+
+
+def task_completed_minutes(task):
+    """Translate Completed Units into completed time using Time Needed."""
+    total_minutes = task.get("minutes", 0)
+    workload = task.get("workload")
+    completed_units = task.get("completed_units", 0) or 0
+
+    if total_minutes <= 0 or workload is None or workload <= 0:
+        return 0
+
+    completed_units = max(0, min(completed_units, workload))
+    return total_minutes * (completed_units / workload)
+
+
+def task_remaining_minutes(task):
+    """Return Time Needed remaining after Completed Units."""
+    return max(
+        0,
+        task.get("minutes", 0) - task_completed_minutes(task),
+    )
 
 
 # ============================================================
@@ -663,6 +763,11 @@ def read_allocations():
         "Task Allocations"
     )
 
+    ensure_date_property(
+        database_id,
+        PLAN_DATE_PROPERTY_NAME,
+    )
+
     data_source_id = get_data_source(
         database_id
     )
@@ -699,6 +804,10 @@ def read_allocations():
             "focus_ids": relation_ids(
                 page,
                 "Focus time",
+            ),
+            "plan_date": date_value(
+                page,
+                PLAN_DATE_PROPERTY_NAME,
             ),
             "allocation": (
                 number_value(
@@ -788,62 +897,34 @@ def calculate_completed_work(
     allocations,
     tasks_by_id,
 ):
-    completed = {}
+    """Return completed minutes derived from each task's Completed Units.
 
-    for allocation in allocations:
-
-        if not allocation["completed"]:
-            continue
-
-        task_id = allocation_task_id(
-            allocation,
-            tasks_by_id,
-        )
-
-        if not task_id:
-            continue
-
-        minutes = allocation_minutes(
-            allocation,
-            tasks_by_id[task_id],
-        )
-
-        completed[task_id] = (
-            completed.get(task_id, 0)
-            + minutes
-        )
-
-    return completed
+    Completed Units is now the authoritative partial-progress input. Task
+    Allocation checkboxes still indicate that a scheduled segment was done,
+    but they no longer determine the task's overall progress.
+    """
+    return {
+        task_id: task_completed_minutes(task)
+        for task_id, task in tasks_by_id.items()
+    }
 
 
 def sync_completed_source_tasks(
     tasks,
     completed,
 ):
-    """Mark source tasks complete when their allocated work is complete.
-
-    Task Allocations represent individual work segments. The source task
-    remains the authoritative record of overall completion. A source task
-    is marked Completed only when completed allocation time reaches its
-    original workload.
-    """
+    """Mark source tasks complete when Completed Units reaches Workload."""
     changed = 0
 
     for task in tasks:
         if task["completed"]:
             continue
 
-        total_minutes = task["minutes"]
-
-        if total_minutes <= 0:
+        workload = task.get("workload")
+        if workload is None or workload <= 0:
             continue
 
-        completed_minutes = completed.get(
-            task["page_id"],
-            0,
-        )
-
-        if completed_minutes < total_minutes:
+        if task.get("completed_units", 0) < workload:
             continue
 
         print(
@@ -1835,14 +1916,7 @@ def schedule_tasks(
 
         remaining[
             task["page_id"]
-        ] = max(
-            0,
-            task["minutes"]
-            - completed.get(
-                task["page_id"],
-                0,
-            ),
-        )
+        ] = task_remaining_minutes(task)
 
     tasks_by_id, _ = (
         build_dependency_graph(
@@ -2347,9 +2421,17 @@ def create_allocation(
                 {"id": focus_id}
                 for focus_id in allocation.get(
                     "focus_page_ids",
-                    [allocation["focus_page_id"]],
+                    ([allocation["focus_page_id"]] if allocation.get("focus_page_id") else []),
                 )
             ]
+        },
+
+        PLAN_DATE_PROPERTY_NAME: {
+            "date": {
+                "start": allocation["plan_date"].isoformat()
+                if allocation.get("plan_date")
+                else None
+            }
         },
 
         "Allocation": {
@@ -2595,14 +2677,7 @@ def update_overdue_flags(
         if task["task"] == PFS_TASK_NAME:
             continue
 
-        remaining = max(
-            0,
-            task["minutes"]
-            - completed.get(
-                task["page_id"],
-                0,
-            ),
-        )
+        remaining = task_remaining_minutes(task)
 
         deadline = task.get(
             "deadline"
@@ -2739,13 +2814,10 @@ def calculate_status(
 
     for task in tasks:
         original_minutes = task["minutes"]
-        completed_minutes = min(
-            original_minutes,
-            completed.get(task["page_id"], 0),
-        )
+        completed_minutes = task_completed_minutes(task)
         completed_minutes_total += completed_minutes
 
-        rem = max(0, original_minutes - completed_minutes)
+        rem = task_remaining_minutes(task)
 
         if task["completed"] or task["task"] == PFS_TASK_NAME:
             continue
@@ -2920,7 +2992,7 @@ def calculate_status(
         if task["page_id"] not in held_ids or task["priority"] == "Low":
             continue
         deadline = actual_deadline_end(task)
-        rem = max(0, task["minutes"] - min(task["minutes"], completed.get(task["page_id"], 0)))
+        rem = task_remaining_minutes(task)
         if deadline is not None and rem > 0 and deadline <= horizon:
             held_deadline_tasks.append((deadline, rem, task))
     held_deadline_tasks.sort(key=lambda item: item[0])
@@ -3271,6 +3343,7 @@ def build_task_fingerprint(tasks):
             ),
 
             task["workload"],
+            task["completed_units"],
             task["unit"],
             task["priority"],
             task["continuous"],
@@ -3336,6 +3409,7 @@ def build_allocation_fingerprint(
                 allocation["completed"],
                 allocation["allocation"],
                 allocation["unit"],
+                allocation.get("plan_date")["start"].isoformat() if allocation.get("plan_date") else None,
                 allocation["hold"],
             )
         )
@@ -3480,9 +3554,16 @@ def update_allocation_page(
                 {"id": focus_id}
                 for focus_id in desired.get(
                     "focus_page_ids",
-                    [desired["focus_page_id"]],
+                    ([desired["focus_page_id"]] if desired.get("focus_page_id") else []),
                 )
             ]
+        },
+        PLAN_DATE_PROPERTY_NAME: {
+            "date": {
+                "start": desired["plan_date"].isoformat()
+                if desired.get("plan_date")
+                else None
+            }
         },
         "Allocation": {"number": minutes_to_units(desired["amount_minutes"], unit)},
         "Unit": {"select": {"name": unit}},
@@ -3497,38 +3578,77 @@ def reconcile_allocations(
     tasks_by_id,
     all_focus_blocks=None,
 ):
-    """Reconcile one displayed allocation per task per calendar day.
+    """Reconcile the Daily Plan without making Focus Time a visibility filter.
 
-    Scheduling is still performed at the Focus Time/block level. This function
-    only groups those already-decided segments for presentation in Notion.
-    Completed and held pages are never reused or overwritten.
+    Each active task gets at most one Daily Plan entry for the day on which it
+    is first scheduled. The Daily Plan entry represents the *full remaining
+    task*, while its Focus Time relation represents only the portion actually
+    scheduled. Tasks with no Focus Time still appear on their deadline day (or
+    today when overdue).
     """
-    def desired_day(item):
-        return item["focus_page_start"].date()
+    now = datetime.now(TZ)
 
-    # Group the scheduler's block-level decisions by task + calendar day.
-    grouped_desired = {}
+    # Group Focus Time decisions by task. The Daily Plan is one task-level row,
+    # not one row per Focus Time chunk.
+    grouped = {}
     for desired in desired_allocations:
-        key = (
-            normalize_notion_id(desired["task"]["page_id"]),
-            desired_day(desired),
-        )
-        group = grouped_desired.setdefault(key, [])
+        task_id = normalize_notion_id(desired["task"]["page_id"])
+        group = grouped.setdefault(task_id, [])
         group.append(desired)
 
     desired_groups = []
-    for items in grouped_desired.values():
+    planned_task_ids = set()
+
+    for task_id, items in grouped.items():
         items.sort(key=lambda item: item["focus_page_start"])
+        task = items[0]["task"]
         first = dict(items[0])
         first["focus_page_ids"] = [item["focus_page_id"] for item in items]
         first["focus_page_id"] = first["focus_page_ids"][0]
-        first["amount_minutes"] = sum(item["amount_minutes"] for item in items)
+        first["plan_date"] = items[0]["focus_page_start"].date()
+        # Show the entire remaining task in the Daily Plan, not merely the
+        # amount of Focus Time assigned to it.
+        first["amount_minutes"] = task_remaining_minutes(task)
         first["schedule_order"] = min(item.get("schedule_order", 0) for item in items)
         first["overdue"] = any(item.get("overdue", False) for item in items)
         desired_groups.append(first)
+        planned_task_ids.add(task_id)
 
-    # Existing active pages are reusable by task + day. Their Focus Time
-    # relation is replaced with all of the blocks used by that day's group.
+    # Any active task that did not receive Focus Time is still put on the Daily
+    # Plan. Its fallback date is its actual deadline, or today if overdue.
+    for task in tasks_by_id.values():
+        task_id = normalize_notion_id(task["page_id"])
+        if task_id in planned_task_ids:
+            continue
+        if task["completed"]:
+            continue
+        if task["task"] == PFS_TASK_NAME:
+            continue
+        remaining = task_remaining_minutes(task)
+        if remaining <= 0:
+            continue
+
+        deadline = actual_deadline_end(task)
+        if not deadline:
+            continue
+
+        plan_date = deadline.date()
+        if plan_date < now.date():
+            plan_date = now.date()
+
+        desired_groups.append({
+            "task": task,
+            "amount_minutes": remaining,
+            "focus_page_ids": [],
+            "focus_page_id": None,
+            "focus_page_start": datetime.combine(plan_date, datetime.min.time(), tzinfo=TZ),
+            "plan_date": plan_date,
+            "schedule_order": 1000000,
+            "overdue": plan_date < now.date(),
+        })
+
+    # Existing active pages are reusable by task + Plan Date. This works for
+    # both scheduled rows and unscheduled rows because Plan Date is explicit.
     reusable = {}
     for allocation in existing_allocations:
         if allocation["completed"] or allocation["hold"]:
@@ -3536,9 +3656,18 @@ def reconcile_allocations(
         task_id = allocation_task_id(allocation, tasks_by_id)
         if not task_id:
             continue
+
+        plan_date = allocation.get("plan_date")
+        if plan_date:
+            key = (normalize_notion_id(task_id), plan_date.date())
+            reusable.setdefault(key, []).append(allocation)
+            continue
+
+        # Backward compatibility for existing rows created before Plan Date.
         for focus_id in allocation["focus_ids"]:
             block = next(
-                (b for b in (all_focus_blocks or []) if normalize_notion_id(b["page_id"]) == normalize_notion_id(focus_id)),
+                (b for b in (all_focus_blocks or [])
+                 if normalize_notion_id(b["page_id"]) == normalize_notion_id(focus_id)),
                 None,
             )
             if block:
@@ -3549,10 +3678,13 @@ def reconcile_allocations(
     used = set()
     to_create = []
 
-    for desired in sorted(desired_groups, key=lambda item: (item["schedule_order"], item["focus_page_start"])):
+    for desired in sorted(
+        desired_groups,
+        key=lambda item: (item["plan_date"], item.get("schedule_order", 0), item["task"]["task"].lower()),
+    ):
         key = (
             normalize_notion_id(desired["task"]["page_id"]),
-            desired_day(desired),
+            desired["plan_date"],
         )
         existing = next(
             (a for a in reusable.get(key, []) if a["page_id"] not in used),
@@ -3569,9 +3701,9 @@ def reconcile_allocations(
         if not a["completed"] and not a["hold"] and a["page_id"] not in used
     ]
 
-    print(f"Allocations updated: {len(used)}")
-    print(f"Allocations to remove: {len(to_remove)}")
-    print(f"New allocations to create: {len(to_create)}")
+    print(f"Daily Plan entries updated: {len(used)}")
+    print(f"Daily Plan entries to remove: {len(to_remove)}")
+    print(f"New Daily Plan entries to create: {len(to_create)}")
 
     for allocation in to_remove:
         archive_page(allocation["page_id"])
@@ -3579,7 +3711,7 @@ def reconcile_allocations(
     for allocation in to_create:
         task = allocation["task"]
         unit = "Hours" if task["task"] == PFS_TASK_NAME else task["unit"]
-        print(f'{task["task"]} → {format_allocation(allocation["amount_minutes"], unit)}')
+        print(f'{task["task"]} → {format_allocation(allocation["amount_minutes"], unit)} on {allocation["plan_date"]}')
         create_allocation(allocation)
 
 
