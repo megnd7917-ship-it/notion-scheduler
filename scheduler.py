@@ -377,6 +377,93 @@ def ensure_date_property(database_id, property_name):
     )
 
 
+def ensure_allocation_relation_properties(database_id):
+    """Ensure Task Allocations has one relation property for every source task database.
+
+    The scheduler writes the source task page into a relation whose property name
+    comes from SOURCE_DATABASES. Older versions of the scheduler assumed those
+    relation properties already existed. If one is missing (as happened with
+    ``COM 210 Task``), Notion rejects the page creation with a 400 validation
+    error. Create any missing one-way relations here before allocations are
+    read or created.
+    """
+    allocation_data_source_id = get_data_source(database_id)
+
+    allocation_source = notion(
+        "GET",
+        f"data_sources/{allocation_data_source_id}",
+    )
+    existing_properties = allocation_source.get("properties", {})
+
+    for source_database_name, relation_name in SOURCE_DATABASES.items():
+        source_database_id = find_database(source_database_name)
+        source_data_source_id = get_data_source(source_database_id)
+
+        existing = existing_properties.get(relation_name)
+        if existing:
+            if existing.get("type") != "relation":
+                raise RuntimeError(
+                    f'The "{relation_name}" property on Task Allocations exists '
+                    f'but is not a relation property.'
+                )
+
+            relation_config = existing.get("relation", {})
+            target_data_source_id = relation_config.get("data_source_id")
+            target_database_id = relation_config.get("database_id")
+
+            if target_data_source_id and target_data_source_id != source_data_source_id:
+                raise RuntimeError(
+                    f'The "{relation_name}" relation on Task Allocations points '
+                    f'to data source {target_data_source_id}, but it should point '
+                    f'to {source_data_source_id} ({source_database_name}).'
+                )
+
+            if (
+                not target_data_source_id
+                and target_database_id
+                and target_database_id != source_database_id
+            ):
+                raise RuntimeError(
+                    f'The "{relation_name}" relation on Task Allocations points '
+                    f'to database {target_database_id}, but it should point '
+                    f'to {source_database_id} ({source_database_name}).'
+                )
+
+            continue
+
+        print(
+            f'Creating "{relation_name}" relation on Task Allocations '
+            f'to {source_database_name}.'
+        )
+
+        notion(
+            "PATCH",
+            f"data_sources/{allocation_data_source_id}",
+            json={
+                "properties": {
+                    relation_name: {
+                        "relation": {
+                            "data_source_id": source_data_source_id,
+                            "single_property": {},
+                        }
+                    }
+                }
+            },
+        )
+
+        # Keep our local schema copy current so multiple missing relations can
+        # be added in one run without depending on another GET response.
+        existing_properties[relation_name] = {
+            "type": "relation",
+            "relation": {
+                "data_source_id": source_data_source_id,
+                "single_property": {},
+            },
+        }
+
+        time.sleep(CREATE_REQUEST_DELAY)
+
+
 def query_data_source(data_source_id):
     pages = []
     cursor = None
@@ -3887,6 +3974,14 @@ def main():
 
     all_focus_blocks, focus_blocks = (
         read_focus_time()
+    )
+
+    allocation_database_id = find_database(
+        "Task Allocations"
+    )
+
+    ensure_allocation_relation_properties(
+        allocation_database_id
     )
 
     allocations = read_allocations()
