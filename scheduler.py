@@ -42,6 +42,11 @@ MAX_RATE_LIMIT_RETRIES = 5
 
 STATE_FILE = os.environ.get("SCHEDULER_STATE_FILE", ".scheduler_state.json")
 
+# The title property in Task Allocations may have been renamed in Notion.
+# We discover its actual property name from the database schema instead of
+# requiring it to be literally called "Name".
+ALLOCATION_TITLE_PROPERTY_NAME = None
+
 SOURCE_DATABASES = {
     "JST To-Do": "JST Task",
     "Reader To-Do": "Reader Task",
@@ -322,7 +327,7 @@ def read_allocations():
 
         allocations.append({
             "page_id": page["id"],
-            "name": title_value(page, "Name"),
+            "name": title_value(page, ALLOCATION_TITLE_PROPERTY_NAME),
             "source_links": source_links,
             "allocation": number_value(page, ALLOCATION_PROPERTY) or 0,
             "unit": select_value(page, UNIT_PROPERTY),
@@ -629,10 +634,26 @@ def get_allocation_schema(database_id):
 
 
 def ensure_allocation_properties(database_id):
-    """Fail loudly rather than recreating properties the user deliberately removed."""
+    """Validate the properties the new scheduler actually needs.
+
+    Notion's title property is allowed to have any name. We discover it from
+    the schema rather than assuming it is literally called "Name".
+    """
+    global ALLOCATION_TITLE_PROPERTY_NAME
     schema = get_allocation_schema(database_id)
+
+    title_properties = [
+        name for name, prop in schema.items()
+        if prop.get("type") == "title"
+    ]
+    if not title_properties:
+        raise RuntimeError(
+            'Task Allocations has no title property. Every Notion database '
+            'must have one title property.'
+        )
+    ALLOCATION_TITLE_PROPERTY_NAME = title_properties[0]
+
     required = {
-        "Name": "title",
         SCHEDULE_ORDER_PROPERTY: "number",
         ALLOCATION_PROPERTY: "number",
         UNIT_PROPERTY: "select",
@@ -663,8 +684,10 @@ def create_allocation(desired):
     display = format_allocation(desired["amount_minutes"], unit)
     relation_name = task["relation_name"]
 
+    if not ALLOCATION_TITLE_PROPERTY_NAME:
+        raise RuntimeError("Task Allocations title property has not been initialized.")
     properties = {
-        "Name": {"title": [{"text": {"content": f'{task["task"]} — {display}'}}]},
+        ALLOCATION_TITLE_PROPERTY_NAME: {"title": [{"text": {"content": f'{task["task"]} — {display}'}}]},
         SCHEDULE_ORDER_PROPERTY: {"number": desired["schedule_order"]},
         ALLOCATION_PROPERTY: {"number": amount},
         UNIT_PROPERTY: {"select": {"name": unit}},
@@ -687,8 +710,10 @@ def update_allocation(allocation, desired):
     task = desired["task"]
     unit = task["unit"]
     display = format_allocation(desired["amount_minutes"], unit)
+    if not ALLOCATION_TITLE_PROPERTY_NAME:
+        raise RuntimeError("Task Allocations title property has not been initialized.")
     properties = {
-        "Name": {"title": [{"text": {"content": f'{task["task"]} — {display}'}}]},
+        ALLOCATION_TITLE_PROPERTY_NAME: {"title": [{"text": {"content": f'{task["task"]} — {display}'}}]},
         SCHEDULE_ORDER_PROPERTY: {"number": desired["schedule_order"]},
         ALLOCATION_PROPERTY: {"number": desired["allocation_units"]},
         UNIT_PROPERTY: {"select": {"name": unit}},
