@@ -630,7 +630,15 @@ def sync_icons(allocations, tasks_by_id, ordered_ids):
 # ============================================================
 
 def get_allocation_schema(database_id):
-    return notion("GET", f"databases/{database_id}").get("properties", {})
+    """Return the actual property schema for Task Allocations.
+
+    With the current Notion API, the database container and its data source
+    are separate objects. The database endpoint may not expose the
+    data-source properties (including the title property), so inspect the
+    data source that we actually query when validating the schema.
+    """
+    data_source_id = get_data_source(database_id)
+    return notion("GET", f"data_sources/{data_source_id}").get("properties", {})
 
 
 def ensure_allocation_properties(database_id):
