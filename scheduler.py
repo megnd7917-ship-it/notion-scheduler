@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 import time
@@ -16,51 +15,41 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_VERSION = "2026-03-11"
 TZ = ZoneInfo("America/Los_Angeles")
 
-PLANNING_DAYS = 14
+# Ahead-of-schedule work begins appearing in this part of the queue.
+AHEAD_OF_SCHEDULE_START = 18
 
-MIN_CHUNK_MINUTES = 15
-PREFERRED_MAX_CHUNK_MINUTES = 45
+# Ahead-of-schedule tasks receive a modest allocation.
+AHEAD_WORK_MINUTES = 45
 
-# Reserve part of each Focus Time day for work whose deadline is still ahead.
-# This prevents urgent work from consuming every available block and creating
-# a permanent catch-up cycle. The reserve is used whenever the urgent workload
-# can fit without it; genuinely overloaded urgent days may temporarily consume
-# the reserve.
-AHEAD_CAPACITY_FRACTION = 0.20
+# Normal work gets a somewhat larger allocation when appropriate.
+NORMAL_WORK_MINUTES = 60
 
-DEPENDENCY_PROPERTY_NAME = "Blocked by"
-COMPLETED_UNITS_PROPERTY_NAME = "Completed Units"
+# If doing the work by the day before the deadline would require
+# more than this many minutes per day, the actual deadline day is
+# included in the calculation.
+MAX_PREFERRED_DAILY_MINUTES = 120
 
-PFS_TASK_NAME = "PFS weekly hours"
-PFS_DATABASE_NAME = "PFS To-Do"
-PFS_WEEKLY_TARGET_MINUTES = 30 * 60
-
-# Only these task databases create a hard "must fit before deadline"
-# scheduling deficit. Other deadlines remain useful as soft scheduling
-# preferences, but they do not make the schedule report a capacity
-# shortfall.
-HARD_DEADLINE_DATABASES = {
-    "COM 210 To-Do",
-    "ENL 248 To-Do",
-    "Independent Study To-Do",
-    "LSAT To-Do",
-    "Applications To-Do",
-}
+# State is used only for queue continuity/bump behavior.
+# It is NOT used to track completed work.
+STATE_FILE = os.environ.get(
+    "SCHEDULER_STATE_FILE",
+    ".scheduler_state.json",
+)
 
 CREATE_REQUEST_DELAY = 0.5
 MAX_RATE_LIMIT_RETRIES = 5
 
+DEPENDENCY_PROPERTY_NAME = "Blocked by"
+COMPLETED_UNITS_PROPERTY_NAME = "Completed Units"
+
+SOURCE_TASK_TITLE_PROPERTY = "Task"
+
+TASK_ALLOCATION_DATABASE = "Task Allocations"
 
 
 # ============================================================
 # SOURCE DATABASES
 # ============================================================
-
-# Each source database has one corresponding one-page relation
-# in Task Allocations.
-#
-# The scheduler reads tasks directly from these databases.
-# There is no Master To-Do List.
 
 SOURCE_DATABASES = {
     "JST To-Do": "JST Task",
@@ -102,49 +91,15 @@ def workload_to_minutes(workload, unit):
 
 
 def minutes_to_units(minutes, unit):
+    if not unit:
+        return 0
+
     if unit not in MINUTES_PER_UNIT:
         raise RuntimeError(
             f'Unknown workload unit "{unit}".'
         )
 
     return minutes / MINUTES_PER_UNIT[unit]
-
-
-def format_minutes(minutes):
-    minutes = int(round(minutes))
-
-    hours = minutes // 60
-    remainder = minutes % 60
-
-    parts = []
-
-    if hours:
-        parts.append(
-            "1 hour" if hours == 1 else f"{hours} hours"
-        )
-
-    if remainder:
-        parts.append(
-            "1 minute"
-            if remainder == 1
-            else f"{remainder} minutes"
-        )
-
-    return " ".join(parts) if parts else "0 minutes"
-
-
-def format_allocation(minutes, unit):
-    if unit in ("Hours", "Minutes"):
-        return format_minutes(minutes)
-
-    amount = minutes_to_units(minutes, unit)
-
-    if amount == int(amount):
-        amount_text = str(int(amount))
-    else:
-        amount_text = f"{amount:g}"
-
-    return f"{amount_text} {unit}"
 
 
 # ============================================================
@@ -298,47 +253,49 @@ def get_data_source(database_id):
 
     if not sources:
         raise RuntimeError(
-            f"No data source found for database "
-            f"{database_id}."
+            f"No data source found for database {database_id}."
         )
 
     return sources[0]["id"]
 
 
-def ensure_database_property(database_id, property_name, property_type, config):
-    """Ensure a property exists on the database's current data source.
+def get_data_source_properties(database_id):
+    data_source_id = get_data_source(database_id)
 
-    Notion's newer API versions expose database properties through data sources.
-    Updating only /databases/{id} can leave the property absent from the data
-    source that is actually used by page creation/update calls, which then
-    produces errors such as "Plan Date is not a property that exists".
-    """
-    database = notion(
+    data = notion(
         "GET",
-        f"databases/{database_id}",
+        f"data_sources/{data_source_id}",
     )
 
-    properties = database.get("properties", {})
+    return (
+        data_source_id,
+        data.get("properties", {})
+    )
+
+
+def ensure_database_property(
+    database_id,
+    property_name,
+    property_type,
+    config,
+):
+    data_source_id, properties = (
+        get_data_source_properties(database_id)
+    )
+
     existing = properties.get(property_name)
+
     if existing:
         if existing.get("type") != property_type:
             raise RuntimeError(
-                f'The "{property_name}" property exists but is not a '
-                f'{property_type} property.'
+                f'The "{property_name}" property exists but '
+                f'is not a {property_type} property.'
             )
+
         return
 
-    data_sources = database.get("data_sources", [])
-    if not data_sources:
-        raise RuntimeError(
-            f"No data source found for database {database_id} while creating "
-            f'"{property_name}".'
-        )
-
-    data_source_id = data_sources[0]["id"]
     print(
-        f'Creating "{property_name}" {property_type} property in '
-        f'data source {data_source_id}.'
+        f'Creating "{property_name}" {property_type} property.'
     )
 
     notion(
@@ -351,83 +308,103 @@ def ensure_database_property(database_id, property_name, property_type, config):
         },
     )
 
+    time.sleep(CREATE_REQUEST_DELAY)
+
 
 def ensure_number_property(database_id, property_name):
-    """Create a number property on a database if it does not already exist."""
     ensure_database_property(
         database_id,
         property_name,
         "number",
-        {"number": {"format": "number"}},
+        {
+            "number": {
+                "format": "number"
+            }
+        },
     )
 
 
-def ensure_date_property(database_id, property_name):
-    """Create a date property on a database if it does not already exist."""
+def ensure_checkbox_property(database_id, property_name):
     ensure_database_property(
         database_id,
         property_name,
-        "date",
-        {"date": {}},
+        "checkbox",
+        {
+            "checkbox": {}
+        },
     )
 
 
-def ensure_allocation_relation_properties(database_id):
-    """Ensure Task Allocations has one relation property for every source task database.
-
-    The scheduler writes the source task page into a relation whose property name
-    comes from SOURCE_DATABASES. Older versions of the scheduler assumed those
-    relation properties already existed. If one is missing (as happened with
-    ``COM 210 Task``), Notion rejects the page creation with a 400 validation
-    error. Create any missing one-way relations here before allocations are
-    read or created.
+def ensure_relation_properties(database_id):
     """
-    allocation_data_source_id = get_data_source(database_id)
+    Make sure Task Allocations has one relation for each
+    source task database.
+    """
 
-    allocation_source = notion(
-        "GET",
-        f"data_sources/{allocation_data_source_id}",
+    allocation_data_source_id, properties = (
+        get_data_source_properties(database_id)
     )
-    existing_properties = allocation_source.get("properties", {})
 
-    for source_database_name, relation_name in SOURCE_DATABASES.items():
-        source_database_id = find_database(source_database_name)
-        source_data_source_id = get_data_source(source_database_id)
+    for source_database_name, relation_name in (
+        SOURCE_DATABASES.items()
+    ):
 
-        existing = existing_properties.get(relation_name)
+        source_database_id = find_database(
+            source_database_name
+        )
+
+        source_data_source_id = get_data_source(
+            source_database_id
+        )
+
+        existing = properties.get(relation_name)
+
         if existing:
+
             if existing.get("type") != "relation":
                 raise RuntimeError(
-                    f'The "{relation_name}" property on Task Allocations exists '
-                    f'but is not a relation property.'
+                    f'The "{relation_name}" property on '
+                    "Task Allocations is not a relation."
                 )
 
-            relation_config = existing.get("relation", {})
-            target_data_source_id = relation_config.get("data_source_id")
-            target_database_id = relation_config.get("database_id")
+            relation = existing.get(
+                "relation",
+                {}
+            )
 
-            if target_data_source_id and target_data_source_id != source_data_source_id:
+            existing_data_source_id = relation.get(
+                "data_source_id"
+            )
+
+            existing_database_id = relation.get(
+                "database_id"
+            )
+
+            if (
+                existing_data_source_id
+                and existing_data_source_id
+                != source_data_source_id
+            ):
                 raise RuntimeError(
-                    f'The "{relation_name}" relation on Task Allocations points '
-                    f'to data source {target_data_source_id}, but it should point '
-                    f'to {source_data_source_id} ({source_database_name}).'
+                    f'The "{relation_name}" relation points '
+                    "to the wrong data source."
                 )
 
             if (
-                not target_data_source_id
-                and target_database_id
-                and target_database_id != source_database_id
+                not existing_data_source_id
+                and existing_database_id
+                and existing_database_id
+                != source_database_id
             ):
                 raise RuntimeError(
-                    f'The "{relation_name}" relation on Task Allocations points '
-                    f'to database {target_database_id}, but it should point '
-                    f'to {source_database_id} ({source_database_name}).'
+                    f'The "{relation_name}" relation points '
+                    "to the wrong database."
                 )
 
             continue
 
         print(
-            f'Creating "{relation_name}" relation on Task Allocations '
+            f'Creating "{relation_name}" relation '
             f'to {source_database_name}.'
         )
 
@@ -438,23 +415,14 @@ def ensure_allocation_relation_properties(database_id):
                 "properties": {
                     relation_name: {
                         "relation": {
-                            "data_source_id": source_data_source_id,
+                            "data_source_id":
+                                source_data_source_id,
                             "single_property": {},
                         }
                     }
                 }
             },
         )
-
-        # Keep our local schema copy current so multiple missing relations can
-        # be added in one run without depending on another GET response.
-        existing_properties[relation_name] = {
-            "type": "relation",
-            "relation": {
-                "data_source_id": source_data_source_id,
-                "single_property": {},
-            },
-        }
 
         time.sleep(CREATE_REQUEST_DELAY)
 
@@ -466,7 +434,7 @@ def query_data_source(data_source_id):
     while True:
 
         payload = {
-            "page_size": 100,
+            "page_size": 100
         }
 
         if cursor:
@@ -488,16 +456,6 @@ def query_data_source(data_source_id):
         cursor = data.get("next_cursor")
 
 
-def archive_page(page_id):
-    notion(
-        "PATCH",
-        f"pages/{page_id}",
-        json={
-            "in_trash": True
-        },
-    )
-
-
 # ============================================================
 # PROPERTY HELPERS
 # ============================================================
@@ -515,8 +473,9 @@ def normalize_notion_id(value):
 
 
 def title_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
     )
 
     if not prop or prop.get("type") != "title":
@@ -529,8 +488,9 @@ def title_value(page, property_name):
 
 
 def checkbox_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
     )
 
     if not prop or prop.get("type") != "checkbox":
@@ -542,8 +502,9 @@ def checkbox_value(page, property_name):
 
 
 def number_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
     )
 
     if not prop or prop.get("type") != "number":
@@ -553,24 +514,26 @@ def number_value(page, property_name):
 
 
 def select_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
     )
 
     if not prop or prop.get("type") != "select":
         return None
 
-    option = prop.get("select")
+    value = prop.get("select")
 
-    if not option:
+    if not value:
         return None
 
-    return option.get("name")
+    return value.get("name")
 
 
 def relation_ids(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
     )
 
     if not prop or prop.get("type") != "relation":
@@ -595,20 +558,21 @@ def parse_datetime(value):
 
 
 def date_value(page, property_name):
-    prop = page.get("properties", {}).get(
-        property_name
+    prop = (
+        page.get("properties", {})
+        .get(property_name)
     )
 
     if not prop or prop.get("type") != "date":
         return None
 
-    date = prop.get("date")
+    value = prop.get("date")
 
-    if not date:
+    if not value:
         return None
 
-    start = date.get("start")
-    end = date.get("end")
+    start = value.get("start")
+    end = value.get("end")
 
     if not start:
         return None
@@ -624,13 +588,86 @@ def date_value(page, property_name):
 
 
 # ============================================================
+# STATE
+# ============================================================
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {
+            "orders": {},
+            "signatures": {},
+        }
+
+    try:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+        if not isinstance(data, dict):
+            raise ValueError
+
+        data.setdefault("orders", {})
+        data.setdefault("signatures", {})
+
+        return data
+
+    except Exception:
+        print(
+            "Warning: scheduler state could not be read. "
+            "Starting with empty queue state."
+        )
+
+        return {
+            "orders": {},
+            "signatures": {},
+        }
+
+
+def save_state(state):
+    directory = os.path.dirname(
+        os.path.abspath(STATE_FILE)
+    )
+
+    os.makedirs(
+        directory,
+        exist_ok=True,
+    )
+
+    temporary = (
+        f"{STATE_FILE}.tmp"
+    )
+
+    with open(
+        temporary,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            state,
+            file,
+            indent=2,
+            sort_keys=True,
+        )
+
+    os.replace(
+        temporary,
+        STATE_FILE,
+    )
+
+
+# ============================================================
 # SOURCE TASKS
 # ============================================================
 
 def read_tasks():
     tasks = []
 
-    for database_name, relation_name in SOURCE_DATABASES.items():
+    for database_name, relation_name in (
+        SOURCE_DATABASES.items()
+    ):
 
         database_id = find_database(
             database_name
@@ -639,6 +676,16 @@ def read_tasks():
         ensure_number_property(
             database_id,
             COMPLETED_UNITS_PROPERTY_NAME,
+        )
+
+        ensure_checkbox_property(
+            database_id,
+            "Bump",
+        )
+
+        ensure_checkbox_property(
+            database_id,
+            "Cancelled",
         )
 
         data_source_id = get_data_source(
@@ -653,31 +700,32 @@ def read_tasks():
 
             name = title_value(
                 page,
-                "Task",
+                SOURCE_TASK_TITLE_PROPERTY,
             ).strip()
 
             if not name:
                 continue
-
-            dependency_property = (
-                page.get("properties", {})
-                .get(DEPENDENCY_PROPERTY_NAME)
-            )
 
             workload = number_value(
                 page,
                 "Workload",
             )
 
-            completed_units = number_value(
-                page,
-                COMPLETED_UNITS_PROPERTY_NAME,
-            ) or 0
+            completed_units = (
+                number_value(
+                    page,
+                    COMPLETED_UNITS_PROPERTY_NAME,
+                )
+                or 0
+            )
 
             if workload is not None:
                 completed_units = max(
                     0,
-                    min(completed_units, workload),
+                    min(
+                        completed_units,
+                        workload,
+                    ),
                 )
 
             unit = select_value(
@@ -690,33 +738,41 @@ def read_tasks():
                 "task": name,
                 "database": database_name,
                 "relation_name": relation_name,
+
                 "deadline": date_value(
                     page,
                     "Deadline",
                 ),
+
                 "workload": workload,
                 "completed_units": completed_units,
                 "unit": unit,
+
                 "priority": select_value(
                     page,
                     "Priority",
                 ),
-                "continuous": checkbox_value(
-                    page,
-                    "Continuous",
-                ),
+
                 "completed": checkbox_value(
                     page,
                     "Completed",
                 ),
-                "hold": checkbox_value(
+
+                "bump": checkbox_value(
                     page,
-                    "Hold",
+                    "Bump",
                 ),
+
+                "cancelled": checkbox_value(
+                    page,
+                    "Cancelled",
+                ),
+
                 "dependencies": relation_ids(
                     page,
                     DEPENDENCY_PROPERTY_NAME,
                 ),
+
                 "minutes": workload_to_minutes(
                     workload,
                     unit,
@@ -731,156 +787,197 @@ def read_tasks():
 
 
 def task_completed_minutes(task):
-    """Translate Completed Units into completed time using Time Needed."""
-    total_minutes = task.get("minutes", 0)
     workload = task.get("workload")
-    completed_units = task.get("completed_units", 0) or 0
+    completed_units = (
+        task.get("completed_units", 0)
+        or 0
+    )
 
-    if total_minutes <= 0 or workload is None or workload <= 0:
+    total_minutes = task.get(
+        "minutes",
+        0,
+    )
+
+    if (
+        workload is None
+        or workload <= 0
+        or total_minutes <= 0
+    ):
         return 0
 
-    completed_units = max(0, min(completed_units, workload))
-    return total_minutes * (completed_units / workload)
-
-
-def task_remaining_minutes(task):
-    """Return Time Needed remaining after Completed Units."""
-    return max(
+    completed_units = max(
         0,
-        task.get("minutes", 0) - task_completed_minutes(task),
+        min(
+            completed_units,
+            workload,
+        ),
+    )
+
+    return (
+        total_minutes
+        * completed_units
+        / workload
     )
 
 
-
-def read_tasks():
-    """Read active source tasks and normalize their scheduling information."""
-    tasks = []
-
-    for database_name, relation_name in SOURCE_DATABASES.items():
-        database_id = find_database(database_name)
-
-        ensure_number_property(
-            database_id,
-            COMPLETED_UNITS_PROPERTY_NAME,
-        )
-
-        data_source_id = get_data_source(database_id)
-        pages = query_data_source(data_source_id)
-
-        for page in pages:
-            name = title_value(page, "Task").strip()
-            if not name:
-                continue
-
-            workload = number_value(page, "Workload")
-            completed_units = number_value(
-                page, COMPLETED_UNITS_PROPERTY_NAME
-            ) or 0
-
-            if workload is not None:
-                completed_units = max(
-                    0, min(completed_units, workload)
-                )
-
-            unit = select_value(page, "Unit")
-            completed = checkbox_value(page, "Completed")
-
-            # A completed source task is never scheduled again.
-            # If Completed Units reaches the full workload, normalize the
-            # checkbox later in sync_master_completion().
-            tasks.append({
-                "page_id": page["id"],
-                "task": name,
-                "database": database_name,
-                "relation_name": relation_name,
-                "deadline": date_value(page, "Deadline"),
-                "workload": workload,
-                "completed_units": completed_units,
-                "unit": unit,
-                "priority": select_value(page, "Priority"),
-                "completed": completed,
-                "bump": checkbox_value(page, "Bump"),
-                "dependencies": relation_ids(
-                    page, DEPENDENCY_PROPERTY_NAME
-                ),
-                "minutes": workload_to_minutes(workload, unit),
-            })
-
-    print(f"Source tasks found: {len(tasks)}")
-    return tasks
-
-
-def task_completed_minutes(task):
-    total_minutes = task.get("minutes", 0)
-    workload = task.get("workload")
-    completed_units = task.get("completed_units", 0) or 0
-
-    if total_minutes <= 0 or workload is None or workload <= 0:
-        return 0
-
-    completed_units = max(0, min(completed_units, workload))
-    return total_minutes * (completed_units / workload)
-
-
 def task_remaining_minutes(task):
     return max(
         0,
-        task.get("minutes", 0) - task_completed_minutes(task),
+        task.get("minutes", 0)
+        - task_completed_minutes(task),
     )
 
 
 def task_remaining_units(task):
     workload = task.get("workload")
+
     if workload is None:
         return 0
 
     return max(
         0,
-        workload - (task.get("completed_units", 0) or 0),
+        workload
+        - (
+            task.get(
+                "completed_units",
+                0,
+            )
+            or 0
+        ),
     )
 
 
-def deadline_target_date(task, now):
-    """Return the preferred completion date.
+# ============================================================
+# DEADLINE CALCULATIONS
+# ============================================================
 
-    Normally the target is the day before the deadline. If that would require
-    more than two hours/day, the deadline day is included.
-    """
-    deadline = task.get("deadline")
+def available_workdays(
+    start_date,
+    target_date,
+):
+    if target_date < start_date:
+        return 1
+
+    return max(
+        1,
+        (
+            target_date - start_date
+        ).days
+        + 1,
+    )
+
+
+def deadline_target_date(
+    task,
+    now,
+):
+    deadline = task.get(
+        "deadline"
+    )
+
     if not deadline:
         return None
 
-    deadline_day = deadline["start"].date()
+    deadline_day = (
+        deadline["start"].date()
+    )
+
     today = now.date()
 
     if deadline_day <= today:
         return today
 
-    preferred = deadline_day - timedelta(days=1)
-    days = max(1, (preferred - today).days + 1)
-    remaining = task_remaining_minutes(task)
+    preferred_target = (
+        deadline_day
+        - timedelta(days=1)
+    )
 
-    if remaining / days > 120:
+    preferred_days = available_workdays(
+        today,
+        preferred_target,
+    )
+
+    remaining_minutes = (
+        task_remaining_minutes(task)
+    )
+
+    preferred_daily_minutes = (
+        remaining_minutes
+        / preferred_days
+    )
+
+    if (
+        preferred_daily_minutes
+        > MAX_PREFERRED_DAILY_MINUTES
+    ):
         return deadline_day
 
-    return preferred
+    return preferred_target
 
 
-def available_workdays(start_date, target_date):
-    if target_date < start_date:
-        return 1
-    # We deliberately count calendar days: the scheduler describes the
-    # workload you need to get through, rather than assuming a fixed workweek.
-    return max(1, (target_date - start_date).days + 1)
+def required_daily_minutes(
+    task,
+    now,
+):
+    target = deadline_target_date(
+        task,
+        now,
+    )
 
-
-def required_daily_minutes(task, now):
-    target = deadline_target_date(task, now)
     if target is None:
         return 0
 
-    days = available_workdays(now.date(), target)
-    return task_remaining_minutes(task) / days
+    days = available_workdays(
+        now.date(),
+        target,
+    )
+
+    return (
+        task_remaining_minutes(task)
+        / days
+    )
+
+
+# ============================================================
+# DEPENDENCIES / PRIORITY / SORTING
+# ============================================================
+
+def dependency_status(
+    task,
+    tasks_by_id,
+):
+    unmet = []
+
+    for dependency_id in task.get(
+        "dependencies",
+        [],
+    ):
+
+        dependency = tasks_by_id.get(
+            normalize_notion_id(
+                dependency_id
+            )
+        )
+
+        if (
+            dependency
+            and not dependency.get(
+                "completed",
+                False,
+            )
+            and not dependency.get(
+                "cancelled",
+                False,
+            )
+        ):
+            unmet.append(
+                dependency["task"]
+            )
+
+    return (
+        bool(unmet),
+        unmet,
+    )
 
 
 def priority_weight(priority):
@@ -888,237 +985,473 @@ def priority_weight(priority):
         "High": 0,
         "Medium": 1,
         "Low": 2,
-    }.get(priority, 1)
+    }.get(
+        priority,
+        1,
+    )
 
 
-def dependency_status(task, tasks_by_id):
-    """Return (blocked, unmet_dependencies)."""
-    unmet = []
+def task_sort_key(
+    task,
+    now,
+    tasks_by_id,
+):
+    deadline = task.get(
+        "deadline"
+    )
 
-    for dependency_id in task.get("dependencies", []):
-        dependency = tasks_by_id.get(
-            normalize_notion_id(dependency_id)
-        )
-        if dependency and not dependency.get("completed"):
-            unmet.append(dependency["task"])
-
-    return bool(unmet), unmet
-
-
-def sort_key(task, now, tasks_by_id):
-    remaining = task_remaining_minutes(task)
-    deadline = task.get("deadline")
-    blocked, _ = dependency_status(task, tasks_by_id)
-
+    days_left = float("inf")
     overdue = False
     due_today = False
-    days_left = float("inf")
 
     if deadline:
-        deadline_day = deadline["start"].date()
-        days_left = (deadline_day - now.date()).days
+
+        deadline_day = (
+            deadline["start"].date()
+        )
+
+        days_left = (
+            deadline_day
+            - now.date()
+        ).days
+
         overdue = days_left < 0
         due_today = days_left == 0
 
-    # Urgency is deadline/workload driven, with explicit Priority able to
-    # elevate genuinely urgent work.
+    blocked, _ = dependency_status(
+        task,
+        tasks_by_id,
+    )
+
+    daily_minutes = (
+        required_daily_minutes(
+            task,
+            now,
+        )
+    )
+
     if overdue:
-        bucket = 0
+        urgency_bucket = 0
+
     elif due_today:
-        bucket = 1
+        urgency_bucket = 1
+
     elif task.get("priority") == "High":
-        bucket = 2
+        urgency_bucket = 2
+
+    elif deadline and daily_minutes > 120:
+        urgency_bucket = 2
+
+    elif deadline and daily_minutes > 60:
+        urgency_bucket = 3
+
     elif deadline:
-        daily = required_daily_minutes(task, now)
-        if daily > 120:
-            bucket = 2
-        elif daily > 60:
-            bucket = 3
-        else:
-            bucket = 4
+        urgency_bucket = 4
+
     else:
-        bucket = 6
+        urgency_bucket = 6
 
     if blocked:
-        bucket += 5
+        urgency_bucket += 5
 
     return (
-        bucket,
-        priority_weight(task.get("priority")),
+        urgency_bucket,
+        priority_weight(
+            task.get("priority")
+        ),
         days_left,
-        -required_daily_minutes(task, now),
+        -daily_minutes,
         task["task"].lower(),
     )
 
 
-def allocation_units_for_task(task, now, rank):
-    """Choose today's useful amount of work for the queue.
+def task_signature(
+    task,
+    now,
+):
+    deadline = task.get(
+        "deadline"
+    )
 
-    The first pass is deadline-driven. Ahead-of-schedule work is deliberately
-    modest so the visible queue remains manageable.
-    """
-    remaining_units = task_remaining_units(task)
+    deadline_text = None
+
+    if deadline:
+        deadline_text = (
+            deadline["start"].isoformat()
+        )
+
+    return (
+        task["task"],
+        task.get("workload"),
+        task.get("completed_units"),
+        task.get("unit"),
+        task.get("priority"),
+        deadline_text,
+        task.get("completed"),
+        task.get("cancelled"),
+        now.date().isoformat(),
+    )
+
+
+# ============================================================
+# TASK ALLOCATION DATABASE
+# ============================================================
+
+def allocation_title_property(
+    database_id,
+):
+    _, properties = (
+        get_data_source_properties(
+            database_id
+        )
+    )
+
+    for name, prop in properties.items():
+
+        if prop.get("type") == "title":
+            return name
+
+    raise RuntimeError(
+        "Task Allocations has no title property."
+    )
+
+
+def ensure_allocation_properties(
+    database_id,
+):
+    ensure_number_property(
+        database_id,
+        "Allocation",
+    )
+
+    ensure_number_property(
+        database_id,
+        "Completed Units",
+    )
+
+    ensure_number_property(
+        database_id,
+        "Schedule Order",
+    )
+
+    ensure_checkbox_property(
+        database_id,
+        "Completed",
+    )
+
+    ensure_checkbox_property(
+        database_id,
+        "Bump",
+    )
+
+    ensure_checkbox_property(
+        database_id,
+        "Cancel",
+    )
+
+    ensure_relation_properties(
+        database_id
+    )
+
+
+def read_allocations():
+    database_id = find_database(
+        TASK_ALLOCATION_DATABASE
+    )
+
+    data_source_id = get_data_source(
+        database_id
+    )
+
+    pages = query_data_source(
+        data_source_id
+    )
+
+    title_name = allocation_title_property(
+        database_id
+    )
+
+    allocations = []
+
+    for page in pages:
+
+        source_links = {}
+
+        for relation_name in (
+            SOURCE_DATABASES.values()
+        ):
+
+            ids = relation_ids(
+                page,
+                relation_name,
+            )
+
+            if ids:
+                source_links[
+                    relation_name
+                ] = ids
+
+        allocations.append({
+            "page_id": page["id"],
+
+            "name": title_value(
+                page,
+                title_name,
+            ),
+
+            "source_links": source_links,
+
+            "allocation": (
+                number_value(
+                    page,
+                    "Allocation",
+                )
+                or 0
+            ),
+
+            "completed_units": (
+                number_value(
+                    page,
+                    "Completed Units",
+                )
+                or 0
+            ),
+
+            "unit": select_value(
+                page,
+                "Unit",
+            ),
+
+            "completed": checkbox_value(
+                page,
+                "Completed",
+            ),
+
+            "bump": checkbox_value(
+                page,
+                "Bump",
+            ),
+
+            "cancel": checkbox_value(
+                page,
+                "Cancel",
+            ),
+
+            "schedule_order": (
+                number_value(
+                    page,
+                    "Schedule Order",
+                )
+            ),
+        })
+
+    print(
+        f"Task Allocations found: "
+        f"{len(allocations)}"
+    )
+
+    return allocations
+
+
+def allocation_task_id(
+    allocation,
+    tasks_by_id,
+):
+    normalized = {
+        normalize_notion_id(
+            task_id
+        ): task_id
+        for task_id in tasks_by_id
+    }
+
+    matches = []
+
+    for ids in allocation[
+        "source_links"
+    ].values():
+
+        for raw_id in ids:
+
+            task_id = normalized.get(
+                normalize_notion_id(
+                    raw_id
+                )
+            )
+
+            if (
+                task_id
+                and task_id not in matches
+            ):
+                matches.append(
+                    task_id
+                )
+
+    if not matches:
+        return None
+
+    if len(matches) > 1:
+        print(
+            f'Warning: allocation '
+            f'"{allocation["name"]}" is linked '
+            "to multiple tasks."
+        )
+
+    return matches[0]
+
+
+# ============================================================
+# ALLOCATION AMOUNTS
+# ============================================================
+
+def allocation_units_for_task(
+    task,
+    now,
+    rank,
+):
+    remaining_units = (
+        task_remaining_units(task)
+    )
+
     if remaining_units <= 0:
         return 0
 
-    daily_minutes = required_daily_minutes(task, now)
+    daily_minutes = (
+        required_daily_minutes(
+            task,
+            now,
+        )
+    )
 
     if daily_minutes > 0:
-        # For urgent work, use the required daily amount. Otherwise cap
-        # individual queue entries at roughly 60 minutes unless the task's
-        # unit requires a larger indivisible amount.
-        minutes = daily_minutes
-        if daily_minutes <= 60 and rank >= 15:
-            minutes = min(daily_minutes, 60)
+
+        if rank >= AHEAD_OF_SCHEDULE_START:
+            minutes = min(
+                daily_minutes,
+                AHEAD_WORK_MINUTES,
+            )
+        else:
+            minutes = max(
+                daily_minutes,
+                NORMAL_WORK_MINUTES
+                if daily_minutes > NORMAL_WORK_MINUTES
+                else daily_minutes,
+            )
+
+        units = minutes_to_units(
+            minutes,
+            task["unit"],
+        )
+
         return max(
             1,
             min(
                 remaining_units,
-                minutes_to_units(minutes, task["unit"]),
+                units,
             ),
         )
 
-    # No-deadline / genuinely ahead-of-schedule work.
-    minutes = 45 if rank >= 15 else 60
+    # No deadline:
+    # deliberately keep these allocations modest.
+    minutes = (
+        AHEAD_WORK_MINUTES
+        if rank >= AHEAD_OF_SCHEDULE_START
+        else NORMAL_WORK_MINUTES
+    )
+
+    units = minutes_to_units(
+        minutes,
+        task["unit"],
+    )
+
     return max(
         1,
         min(
             remaining_units,
-            minutes_to_units(minutes, task["unit"]),
+            units,
         ),
     )
 
 
 # ============================================================
-# TASK ALLOCATIONS
+# NOTION ALLOCATION UPDATES
 # ============================================================
 
-ALLOCATION_PROPERTIES = {
-    "Allocation": "number",
-    "Completed Units": "number",
-    "Bump": "checkbox",
-    "Cancel": "checkbox",
-    "Schedule Order": "number",
-}
+def update_allocation(
+    page_id,
+    properties,
+):
+    if not properties:
+        return
 
-
-def allocation_title_property(database_id):
-    source_id = get_data_source(database_id)
-    source = notion("GET", f"data_sources/{source_id}")
-    for name, prop in source.get("properties", {}).items():
-        if prop.get("type") == "title":
-            return name
-    raise RuntimeError(
-        "Task Allocations has no title property in its data source."
+    notion(
+        "PATCH",
+        f"pages/{page_id}",
+        json={
+            "properties": properties
+        },
     )
 
 
-def ensure_allocation_properties(database_id):
-    """Ensure only the properties actively used by the new scheduler exist."""
-    ensure_number_property(database_id, "Allocation")
-    ensure_number_property(database_id, "Completed Units")
-
-    source_id = get_data_source(database_id)
-    source = notion("GET", f"data_sources/{source_id}")
-    props = source.get("properties", {})
-
-    for name, config in {
-        "Bump": {"checkbox": {}},
-        "Cancel": {"checkbox": {}},
-    }.items():
-        if name not in props:
-            notion(
-                "PATCH",
-                f"data_sources/{source_id}",
-                json={"properties": {name: config}},
-            )
-            time.sleep(CREATE_REQUEST_DELAY)
-        elif props[name].get("type") != "checkbox":
-            raise RuntimeError(
-                f'"{name}" exists on Task Allocations but is not a checkbox.'
-            )
-
-    ensure_number_property(database_id, "Schedule Order")
-
-    ensure_allocation_relation_properties(database_id)
-
-
-def read_allocations():
-    database_id = find_database("Task Allocations")
-    data_source_id = get_data_source(database_id)
-    pages = query_data_source(data_source_id)
-    title_name = allocation_title_property(database_id)
-
-    allocations = []
-
-    for page in pages:
-        source_links = {}
-        for relation_name in SOURCE_DATABASES.values():
-            ids = relation_ids(page, relation_name)
-            if ids:
-                source_links[relation_name] = ids
-
-        allocations.append({
-            "page_id": page["id"],
-            "name": title_value(page, title_name),
-            "source_links": source_links,
-            "allocation": number_value(page, "Allocation") or 0,
-            "completed_units": number_value(
-                page, "Completed Units"
-            ) or 0,
-            "unit": select_value(page, "Unit"),
-            "completed": checkbox_value(page, "Completed"),
-            "bump": checkbox_value(page, "Bump"),
-            "cancel": checkbox_value(page, "Cancel"),
-            "schedule_order": number_value(page, "Schedule Order"),
-        })
-
-    return allocations
-
-
-def allocation_task_id(allocation, tasks_by_id):
-    normalized = {
-        normalize_notion_id(task_id): task_id
-        for task_id in tasks_by_id
-    }
-
-    matches = []
-    for ids in allocation["source_links"].values():
-        for raw_id in ids:
-            task_id = normalized.get(normalize_notion_id(raw_id))
-            if task_id and task_id not in matches:
-                matches.append(task_id)
-
-    return matches[0] if matches else None
-
-
-def create_allocation(database_id, task, units, order):
-    title_name = allocation_title_property(database_id)
+def create_allocation(
+    database_id,
+    task,
+    units,
+    order,
+):
+    title_name = (
+        allocation_title_property(
+            database_id
+        )
+    )
 
     properties = {
         title_name: {
             "title": [
                 {
                     "text": {
-                        "content": task["task"]
+                        "content":
+                            task["task"]
                     }
                 }
             ]
         },
-        "Allocation": {"number": units},
-        "Completed Units": {"number": 0},
-        "Completed": {"checkbox": False},
-        "Bump": {"checkbox": False},
-        "Cancel": {"checkbox": False},
-        "Schedule Order": {"number": order},
+
+        "Allocation": {
+            "number": units
+        },
+
+        "Completed Units": {
+            "number": 0
+        },
+
+        "Completed": {
+            "checkbox": False
+        },
+
+        "Bump": {
+            "checkbox": False
+        },
+
+        "Cancel": {
+            "checkbox": False
+        },
+
+        "Schedule Order": {
+            "number": order
+        },
+
         "Unit": {
             "select": {
                 "name": task["unit"]
             }
         },
+
         task["relation_name"]: {
             "relation": [
-                {"id": task["page_id"]}
+                {
+                    "id":
+                        task["page_id"]
+                }
             ]
         },
     }
@@ -1127,204 +1460,1085 @@ def create_allocation(database_id, task, units, order):
         "POST",
         "pages",
         json={
-            "parent": {"database_id": database_id},
-            "properties": properties,
+            "parent": {
+                "database_id":
+                    database_id
+            },
+            "properties":
+                properties,
+        },
+    )
+
+    time.sleep(
+        CREATE_REQUEST_DELAY
+    )
+
+
+def archive_page(page_id):
+    notion(
+        "PATCH",
+        f"pages/{page_id}",
+        json={
+            "in_trash": True
         },
     )
 
 
-def update_allocation(page_id, properties):
+# ============================================================
+# MASTER TASK UPDATES
+# ============================================================
+
+def update_master(
+    task,
+    properties,
+):
+    if not properties:
+        return
+
     notion(
         "PATCH",
-        f"pages/{page_id}",
-        json={"properties": properties},
+        f"pages/{task['page_id']}",
+        json={
+            "properties": properties
+        },
     )
 
 
-def sync_master_completion(tasks):
-    """Make Completed authoritative at the master-task level."""
-    for task in tasks:
-        workload = task.get("workload")
-        completed_units = task.get("completed_units", 0) or 0
-
-        if workload is None or workload <= 0:
-            continue
-
-        should_be_completed = completed_units >= workload
-
-        if should_be_completed and not task["completed"]:
-            notion(
-                "PATCH",
-                f"pages/{task['page_id']}",
-                json={
-                    "properties": {
-                        "Completed": {"checkbox": True}
-                    }
-                },
-            )
-
-
-def apply_bumps(tasks, tasks_by_id, now):
-    """Move checked Bump tasks down exactly three queue positions.
-
-    Bump is an action: after it is consumed, the checkbox is reset immediately.
+def process_completed_units(
+    allocations,
+    tasks_by_id,
+):
     """
-    ordered = sorted(
-        tasks,
-        key=lambda t: sort_key(t, now, tasks_by_id),
-    )
+    Completed Units on an allocation means:
 
-    for task in list(ordered):
-        if not task.get("bump"):
-            continue
+        "How many units did I actually complete
+         from this allocation?"
 
-        try:
-            index = ordered.index(task)
-        except ValueError:
-            continue
+    The amount is immediately credited to the master task,
+    then the allocation's Completed Units is reset to zero.
 
-        new_index = min(len(ordered) - 1, index + 3)
-        ordered.pop(index)
-        ordered.insert(new_index, task)
+    This means a scheduler rerun can never credit the same
+    seven pages twice.
+    """
 
-        notion(
-            "PATCH",
-            f"pages/{task['page_id']}",
-            json={
-                "properties": {
-                    "Bump": {"checkbox": False}
-                }
-            },
-        )
-        task["bump"] = False
+    changed = False
 
-    return ordered
-
-
-def process_allocation_actions(allocations, tasks_by_id):
-    """Propagate Daily Plan completion/cancellation/partial progress."""
     for allocation in allocations:
-        task_id = allocation_task_id(allocation, tasks_by_id)
+
+        task_id = allocation_task_id(
+            allocation,
+            tasks_by_id,
+        )
+
         if not task_id:
             continue
 
-        task = tasks_by_id[task_id]
+        task = tasks_by_id[
+            task_id
+        ]
 
-        if allocation["cancel"]:
-            notion(
-                "PATCH",
-                f"pages/{task_id}",
-                json={
-                    "properties": {
-                        "Completed": {"checkbox": False}
-                    }
-                },
+        completed_units = (
+            allocation.get(
+                "completed_units",
+                0,
             )
+            or 0
+        )
+
+        if completed_units <= 0:
+            continue
+
+        workload = task.get(
+            "workload"
+        )
+
+        if workload is None:
+            print(
+                f'Warning: cannot credit '
+                f'{allocation["name"]} because '
+                "the master task has no workload."
+            )
+
             update_allocation(
                 allocation["page_id"],
-                {"Cancel": {"checkbox": False}},
+                {
+                    "Completed Units": {
+                        "number": 0
+                    }
+                },
             )
-            # Cancellation is represented by removing this allocation from
-            # the active queue; the master checkbox remains available for
-            # future explicit cancellation-property support.
+
             continue
 
-        completed_units = allocation.get("completed_units", 0) or 0
-        if completed_units > 0:
-            new_total = min(
-                task["workload"],
-                task["completed_units"] + completed_units,
+        current_total = (
+            task.get(
+                "completed_units",
+                0,
+            )
+            or 0
+        )
+
+        new_total = min(
+            workload,
+            current_total
+            + completed_units,
+        )
+
+        if new_total != current_total:
+
+            properties = {
+                "Completed Units": {
+                    "number": new_total
+                }
+            }
+
+            if new_total >= workload:
+                properties[
+                    "Completed"
+                ] = {
+                    "checkbox": True
+                }
+
+            update_master(
+                task,
+                properties,
             )
 
-            notion(
-                "PATCH",
-                f"pages/{task_id}",
-                json={
-                    "properties": {
-                        "Completed Units": {
-                            "number": new_total
-                        },
-                        "Completed": {
-                            "checkbox": (
-                                new_total >= task["workload"]
-                            )
-                        },
+            task[
+                "completed_units"
+            ] = new_total
+
+            if new_total >= workload:
+                task[
+                    "completed"
+                ] = True
+
+            changed = True
+
+        # Clear the allocation's one-time
+        # progress entry after crediting it.
+        update_allocation(
+            allocation["page_id"],
+            {
+                "Completed Units": {
+                    "number": 0
+                }
+            },
+        )
+
+        allocation[
+            "completed_units"
+        ] = 0
+
+        print(
+            f'Credited {completed_units:g} '
+            f'{task["unit"]} to '
+            f'"{task["task"]}".'
+        )
+
+    return changed
+
+
+def process_completed_allocations(
+    allocations,
+    tasks_by_id,
+):
+    """
+    Checking Completed means the user completed
+    the entire current allocation.
+    """
+
+    changed = False
+
+    for allocation in allocations:
+
+        if not allocation.get(
+            "completed"
+        ):
+            continue
+
+        task_id = allocation_task_id(
+            allocation,
+            tasks_by_id,
+        )
+
+        if not task_id:
+            continue
+
+        task = tasks_by_id[
+            task_id
+        ]
+
+        workload = task.get(
+            "workload"
+        )
+
+        if workload is None:
+            update_allocation(
+                allocation["page_id"],
+                {
+                    "Completed": {
+                        "checkbox": False
                     }
                 },
             )
 
-        if allocation["completed"]:
-            notion(
-                "PATCH",
-                f"pages/{task_id}",
-                json={
-                    "properties": {
-                        "Completed": {"checkbox": True},
-                        "Completed Units": {
-                            "number": task["workload"]
-                        },
+            continue
+
+        current_total = (
+            task.get(
+                "completed_units",
+                0,
+            )
+            or 0
+        )
+
+        new_total = workload
+
+        if current_total < new_total:
+
+            update_master(
+                task,
+                {
+                    "Completed Units": {
+                        "number":
+                            new_total
+                    },
+                    "Completed": {
+                        "checkbox":
+                            True
+                    },
+                },
+            )
+
+            task[
+                "completed_units"
+            ] = new_total
+
+            task[
+                "completed"
+            ] = True
+
+        update_allocation(
+            allocation["page_id"],
+            {
+                "Completed": {
+                    "checkbox": False
+                },
+                "Completed Units": {
+                    "number": 0
+                },
+            },
+        )
+
+        allocation[
+            "completed"
+        ] = False
+
+        changed = True
+
+        print(
+            f'Completed task: '
+            f'"{task["task"]}".'
+        )
+
+    return changed
+
+
+def process_cancellations(
+    allocations,
+    tasks_by_id,
+):
+    """
+    Cancel is intentionally different from Bump.
+
+    Cancel means the task no longer needs to appear
+    in the scheduler. The master task receives
+    Cancelled = True, and the allocation is archived.
+    """
+
+    changed = False
+    cancelled_page_ids = set()
+
+    for allocation in allocations:
+
+        if not allocation.get(
+            "cancel"
+        ):
+            continue
+
+        task_id = allocation_task_id(
+            allocation,
+            tasks_by_id,
+        )
+
+        if not task_id:
+            # Still remove the orphaned allocation.
+            archive_page(
+                allocation["page_id"]
+            )
+            changed = True
+            continue
+
+        task = tasks_by_id[
+            task_id
+        ]
+
+        update_master(
+            task,
+            {
+                "Cancelled": {
+                    "checkbox": True
+                }
+            },
+        )
+
+        task[
+            "cancelled"
+        ] = True
+
+        archive_page(
+            allocation["page_id"]
+        )
+
+        cancelled_page_ids.add(
+            allocation["page_id"]
+        )
+
+        changed = True
+
+        print(
+            f'Cancelled task: '
+            f'"{task["task"]}".'
+        )
+
+    return (
+        changed,
+        cancelled_page_ids,
+    )
+
+
+def sync_master_completion(
+    tasks,
+):
+    changed = False
+
+    for task in tasks:
+
+        workload = task.get(
+            "workload"
+        )
+
+        if workload is None:
+            continue
+
+        completed_units = (
+            task.get(
+                "completed_units",
+                0,
+            )
+            or 0
+        )
+
+        if (
+            completed_units >= workload
+            and not task.get(
+                "completed"
+            )
+        ):
+
+            update_master(
+                task,
+                {
+                    "Completed": {
+                        "checkbox": True
                     }
                 },
             )
 
+            task[
+                "completed"
+            ] = True
 
-def rebuild_queue(tasks):
-    database_id = find_database("Task Allocations")
+            changed = True
+
+    return changed
+
+
+# ============================================================
+# BUMP
+# ============================================================
+
+def apply_bumps(
+    ordered_tasks,
+    allocations_by_task,
+):
+    """
+    Bump is an action, not a permanent task state.
+
+    The current queue is taken as the starting order and
+    the bumped task is moved down exactly three positions.
+
+    The resulting order is written into Schedule Order,
+    so it persists until a meaningful queue recalculation.
+    """
+
+    result = list(
+        ordered_tasks
+    )
+
+    bumped = []
+
+    for task in list(result):
+
+        allocation = (
+            allocations_by_task.get(
+                normalize_notion_id(
+                    task["page_id"]
+                )
+            )
+        )
+
+        if not allocation:
+            continue
+
+        if not allocation.get(
+            "bump"
+        ):
+            continue
+
+        bumped.append(
+            allocation
+        )
+
+    for allocation in bumped:
+
+        task_id = allocation_task_id(
+            allocation,
+            {
+                normalize_notion_id(
+                    task["page_id"]
+                ): task
+                for task in result
+            },
+        )
+
+        if not task_id:
+            continue
+
+        current_index = None
+
+        for index, task in enumerate(
+            result
+        ):
+            if normalize_notion_id(
+                task["page_id"]
+            ) == normalize_notion_id(
+                task_id
+            ):
+                current_index = index
+                break
+
+        if current_index is None:
+            continue
+
+        new_index = min(
+            len(result) - 1,
+            current_index + 3,
+        )
+
+        task = result.pop(
+            current_index
+        )
+
+        result.insert(
+            new_index,
+            task,
+        )
+
+        update_allocation(
+            allocation["page_id"],
+            {
+                "Bump": {
+                    "checkbox": False
+                }
+            },
+        )
+
+        allocation[
+            "bump"
+        ] = False
+
+        print(
+            f'Bumped "{task["task"]}" '
+            f"from position "
+            f"{current_index + 1} to "
+            f"{new_index + 1}."
+        )
+
+    return result
+
+
+# ============================================================
+# QUEUE RECONCILIATION
+# ============================================================
+
+def build_desired_order(
+    tasks,
+    tasks_by_id,
+    now,
+):
+    return sorted(
+        tasks,
+        key=lambda task:
+            task_sort_key(
+                task,
+                now,
+                tasks_by_id,
+            ),
+    )
+
+
+def allocation_map(
+    allocations,
+    tasks_by_id,
+):
+    result = {}
+
+    for allocation in allocations:
+
+        task_id = allocation_task_id(
+            allocation,
+            tasks_by_id,
+        )
+
+        if not task_id:
+            continue
+
+        normalized = (
+            normalize_notion_id(
+                task_id
+            )
+        )
+
+        if normalized in result:
+            # Duplicate allocations for the same task
+            # are handled later.
+            result[normalized].append(
+                allocation
+            )
+        else:
+            result[normalized] = [
+                allocation
+            ]
+
+    return result
+
+
+def choose_existing_allocation(
+    allocations,
+):
+    """
+    If duplicates exist, preserve the allocation with
+    the lowest existing Schedule Order.
+
+    The others are archived as true duplicates.
+    """
+
+    if not allocations:
+        return None, []
+
+    sorted_allocations = sorted(
+        allocations,
+        key=lambda allocation: (
+            allocation.get(
+                "schedule_order"
+            )
+            if allocation.get(
+                "schedule_order"
+            ) is not None
+            else 999999,
+            allocation["page_id"],
+        ),
+    )
+
+    return (
+        sorted_allocations[0],
+        sorted_allocations[1:],
+    )
+
+
+def reconcile_queue(
+    tasks,
+    allocations,
+    now,
+    state,
+):
+    tasks_by_id = {
+        normalize_notion_id(
+            task["page_id"]
+        ): task
+        for task in tasks
+    }
+
+    # --------------------------------------------------------
+    # Remove completed/cancelled allocations.
+    # --------------------------------------------------------
+
+    for allocation in allocations:
+
+        task_id = allocation_task_id(
+            allocation,
+            tasks_by_id,
+        )
+
+        if not task_id:
+            # Orphaned allocation.
+            print(
+                f'Archiving orphaned allocation '
+                f'"{allocation["name"]}".'
+            )
+
+            archive_page(
+                allocation["page_id"]
+            )
+
+            continue
+
+        task = tasks_by_id[
+            task_id
+        ]
+
+        if (
+            task.get("completed")
+            or task.get("cancelled")
+            or task_remaining_minutes(
+                task
+            ) <= 0
+        ):
+            archive_page(
+                allocation["page_id"]
+            )
+
+    # Re-read because some allocations may have
+    # been archived above.
     allocations = read_allocations()
-    tasks_by_id = {
-        normalize_notion_id(task["page_id"]): task
+
+    allocation_groups = allocation_map(
+        allocations,
+        tasks_by_id,
+    )
+
+    active_tasks = [
+        task
         for task in tasks
-    }
-
-    process_allocation_actions(allocations, tasks_by_id)
-
-    # Refresh task data after actions have propagated.
-    tasks = read_tasks()
-    tasks_by_id = {
-        normalize_notion_id(task["page_id"]): task
-        for task in tasks
-    }
-
-    sync_master_completion(tasks)
-
-    active = [
-        task for task in tasks
-        if not task["completed"]
-        and task_remaining_minutes(task) > 0
+        if not task.get("completed")
+        and not task.get("cancelled")
+        and task_remaining_minutes(
+            task
+        ) > 0
     ]
 
-    now = datetime.now(TZ)
-    ordered = apply_bumps(active, tasks_by_id, now)
+    active_ids = {
+        normalize_notion_id(
+            task["page_id"]
+        )
+        for task in active_tasks
+    }
 
-    # Because Task Allocations was intentionally emptied, build a clean queue.
-    # If allocations already exist, archive them and rebuild so Schedule Order
-    # is deterministic and stale rows cannot survive.
-    for allocation in read_allocations():
-        archive_page(allocation["page_id"])
+    # --------------------------------------------------------
+    # Remove duplicate allocations, but ONLY duplicates.
+    # --------------------------------------------------------
 
-    for index, task in enumerate(ordered, start=1):
-        units = allocation_units_for_task(task, now, index)
+    primary_allocations = {}
+
+    for task_id, group in (
+        allocation_groups.items()
+    ):
+
+        primary, duplicates = (
+            choose_existing_allocation(
+                group
+            )
+        )
+
+        if primary:
+            primary_allocations[
+                task_id
+            ] = primary
+
+        for duplicate in duplicates:
+
+            print(
+                f'Archiving duplicate allocation '
+                f'"{duplicate["name"]}".'
+            )
+
+            archive_page(
+                duplicate["page_id"]
+            )
+
+    # --------------------------------------------------------
+    # Determine whether the queue needs a fresh ordering.
+    #
+    # We do NOT automatically reorder everything just because
+    # the scheduler ran.
+    # --------------------------------------------------------
+
+    signatures = state.setdefault(
+        "signatures",
+        {}
+    )
+
+    current_signatures = {
+        normalize_notion_id(
+            task["page_id"]
+        ): task_signature(
+            task,
+            now,
+        )
+        for task in active_tasks
+    }
+
+    queue_needs_reorder = (
+        current_signatures
+        != signatures
+    )
+
+    if queue_needs_reorder:
+
+        ordered = build_desired_order(
+            active_tasks,
+            tasks_by_id,
+            now,
+        )
+
+        print(
+            "Queue inputs changed; "
+            "recalculating order."
+        )
+
+    else:
+
+        # Nothing relevant changed.
+        # Preserve the current Task Allocation order.
+        order_pairs = []
+
+        for task in active_tasks:
+
+            task_id = normalize_notion_id(
+                task["page_id"]
+            )
+
+            allocation = (
+                primary_allocations.get(
+                    task_id
+                )
+            )
+
+            existing_order = None
+
+            if allocation:
+                existing_order = (
+                    allocation.get(
+                        "schedule_order"
+                    )
+                )
+
+            if existing_order is None:
+                existing_order = 999999
+
+            order_pairs.append(
+                (
+                    existing_order,
+                    task,
+                )
+            )
+
+        ordered = [
+            task
+            for _, task in sorted(
+                order_pairs,
+                key=lambda pair: (
+                    pair[0],
+                    pair[1]["task"].lower(),
+                ),
+            )
+        ]
+
+        print(
+            "Queue inputs unchanged; "
+            "preserving existing order."
+        )
+
+    # --------------------------------------------------------
+    # Apply Bump after establishing the starting order.
+    # --------------------------------------------------------
+
+    allocations_for_bump = {}
+
+    for task_id, allocation in (
+        primary_allocations.items()
+    ):
+        allocations_for_bump[
+            task_id
+        ] = allocation
+
+    ordered = apply_bumps(
+        ordered,
+        allocations_for_bump,
+    )
+
+    # --------------------------------------------------------
+    # Reconcile every active task in place.
+    # --------------------------------------------------------
+
+    allocation_count = 0
+    created_count = 0
+    updated_count = 0
+
+    database_id = find_database(
+        TASK_ALLOCATION_DATABASE
+    )
+
+    for index, task in enumerate(
+        ordered,
+        start=1,
+    ):
+
+        task_id = normalize_notion_id(
+            task["page_id"]
+        )
+
+        allocation = (
+            primary_allocations.get(
+                task_id
+            )
+        )
+
+        units = (
+            allocation_units_for_task(
+                task,
+                now,
+                index,
+            )
+        )
+
         if units <= 0:
             continue
-        create_allocation(database_id, task, units, index)
-        time.sleep(CREATE_REQUEST_DELAY)
 
-    print(f"Queue rebuilt: {min(len(ordered), len(ordered))} active tasks.")
+        if allocation is None:
 
+            create_allocation(
+                database_id,
+                task,
+                units,
+                index,
+            )
+
+            created_count += 1
+            allocation_count += 1
+
+            print(
+                f'Created allocation: '
+                f'"{task["task"]}" '
+                f"= {units:g} "
+                f'{task["unit"]}'
+            )
+
+            continue
+
+        allocation_count += 1
+
+        properties = {}
+
+        old_units = (
+            allocation.get(
+                "allocation",
+                0,
+            )
+            or 0
+        )
+
+        if abs(
+            old_units - units
+        ) > 0.000001:
+
+            properties[
+                "Allocation"
+            ] = {
+                "number": units
+            }
+
+        old_unit = allocation.get(
+            "unit"
+        )
+
+        if old_unit != task["unit"]:
+
+            properties[
+                "Unit"
+            ] = {
+                "select": {
+                    "name":
+                        task["unit"]
+                }
+            }
+
+        old_order = allocation.get(
+            "schedule_order"
+        )
+
+        if old_order != index:
+
+            properties[
+                "Schedule Order"
+            ] = {
+                "number": index
+            }
+
+        if properties:
+
+            update_allocation(
+                allocation["page_id"],
+                properties,
+            )
+
+            updated_count += 1
+
+            print(
+                f'Updated allocation: '
+                f'"{task["task"]}"'
+            )
+
+    # --------------------------------------------------------
+    # Save queue signatures AFTER reconciliation.
+    # --------------------------------------------------------
+
+    state["signatures"] = current_signatures
+
+    # Keep order information useful for diagnostics and
+    # future recovery.
+    state["orders"] = {
+        normalize_notion_id(
+            task["page_id"]
+        ): index
+        for index, task in enumerate(
+            ordered,
+            start=1,
+        )
+    }
+
+    save_state(
+        state
+    )
+
+    print(
+        "Queue reconciled: "
+        f"{allocation_count} existing/active allocations, "
+        f"{created_count} created, "
+        f"{updated_count} updated."
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    print("=" * 50)
-    print("NOTION DAILY QUEUE SCHEDULER")
-    print("=" * 50)
+    print("=" * 60)
+    print("NOTION TASK QUEUE SCHEDULER")
+    print("=" * 60)
+
+    state = load_state()
+
+    # --------------------------------------------------------
+    # Read source tasks.
+    # --------------------------------------------------------
 
     tasks = read_tasks()
 
-    allocations_database_id = find_database("Task Allocations")
-    ensure_allocation_properties(allocations_database_id)
+    # --------------------------------------------------------
+    # Ensure Task Allocations has the properties it actually
+    # needs. No Focus Time or Plan Date properties are created.
+    # --------------------------------------------------------
 
-    rebuild_queue(tasks)
+    allocation_database_id = find_database(
+        TASK_ALLOCATION_DATABASE
+    )
 
-    print("Done.")
+    ensure_allocation_properties(
+        allocation_database_id
+    )
+
+    # --------------------------------------------------------
+    # Read current allocations.
+    # --------------------------------------------------------
+
+    allocations = read_allocations()
+
+    tasks_by_id = {
+        normalize_notion_id(
+            task["page_id"]
+        ): task
+        for task in tasks
+    }
+
+    # --------------------------------------------------------
+    # Process user actions BEFORE calculating the new queue.
+    # --------------------------------------------------------
+
+    progress_changed = (
+        process_completed_units(
+            allocations,
+            tasks_by_id,
+        )
+    )
+
+    completion_changed = (
+        process_completed_allocations(
+            allocations,
+            tasks_by_id,
+        )
+    )
+
+    cancellation_changed, cancelled_ids = (
+        process_cancellations(
+            allocations,
+            tasks_by_id,
+        )
+    )
+
+    sync_master_completion(
+        tasks
+    )
+
+    # --------------------------------------------------------
+    # Read source tasks again so the scheduler is working from
+    # the actual master-task values after user actions.
+    # --------------------------------------------------------
+
+    tasks = read_tasks()
+
+    now = datetime.now(TZ)
+
+    allocations = read_allocations()
+
+    # --------------------------------------------------------
+    # Reconcile existing allocations rather than deleting and
+    # recreating them.
+    # --------------------------------------------------------
+
+    reconcile_queue(
+        tasks,
+        allocations,
+        now,
+        state,
+    )
+
+    print("=" * 60)
+    print("DONE")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
