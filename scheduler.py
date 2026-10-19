@@ -375,6 +375,16 @@ def ensure_number_property(database_id, property_name):
     )
 
 
+def ensure_checkbox_property(database_id, property_name):
+    """Create a checkbox property on a database if it does not already exist."""
+    ensure_database_property(
+        database_id,
+        property_name,
+        "checkbox",
+        {"checkbox": {}},
+    )
+
+
 def ensure_date_property(database_id, property_name):
     """Create a date property on a database if it does not already exist."""
     ensure_database_property(
