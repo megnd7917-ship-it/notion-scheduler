@@ -16,37 +16,12 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_VERSION = "2026-03-11"
 TZ = ZoneInfo("America/Los_Angeles")
 
-PLANNING_DAYS = 14
-
-MIN_CHUNK_MINUTES = 15
-PREFERRED_MAX_CHUNK_MINUTES = 45
-
-# The scheduler keeps ahead-of-schedule work modest so the visible queue
-# remains useful rather than becoming an enormous backlog.
-AHEAD_OF_SCHEDULE_START = 18
-AHEAD_WORK_MINUTES = 45
-NORMAL_WORK_MINUTES = 60
-MAX_PREFERRED_DAILY_MINUTES = 120
 
 DEPENDENCY_PROPERTY_NAME = "Blocked by"
 COMPLETED_UNITS_PROPERTY_NAME = "Completed Units"
 
 PFS_TASK_NAME = "PFS weekly hours"
 PFS_DATABASE_NAME = "PFS To-Do"
-PFS_WEEKLY_TARGET_MINUTES = 30 * 60
-
-# Only these task databases create a hard "must fit before deadline"
-# scheduling deficit. Other deadlines remain useful as soft scheduling
-# preferences, but they do not make the schedule report a capacity
-# shortfall.
-HARD_DEADLINE_DATABASES = {
-    "COM 210 To-Do",
-    "ENL 248 To-Do",
-    "Independent Study To-Do",
-    "LSAT To-Do",
-    "Applications To-Do",
-}
-
 CREATE_REQUEST_DELAY = 0.5
 MAX_RATE_LIMIT_RETRIES = 5
 
@@ -146,18 +121,17 @@ def format_minutes(minutes):
     return " ".join(parts) if parts else "0 minutes"
 
 
-def format_allocation(minutes, unit):
-    if unit in ("Hours", "Minutes"):
-        return format_minutes(minutes)
-
-    amount = minutes_to_units(minutes, unit)
-
-    if amount == int(amount):
-        amount_text = str(int(amount))
-    else:
-        amount_text = f"{amount:g}"
-
-    return f"{amount_text} {unit}"
+def format_task_estimate(minutes):
+    """Format remaining estimated work compactly for the Daily Plan title."""
+    minutes = max(0, int(round(minutes)))
+    if minutes >= 60 and minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours} hr" if hours == 1 else f"{hours} hrs"
+    if minutes >= 60:
+        hours = minutes // 60
+        remainder = minutes % 60
+        return f"{hours} hr {remainder} mins"
+    return f"{minutes} min" if minutes == 1 else f"{minutes} mins"
 
 
 # ============================================================
@@ -319,20 +293,26 @@ def get_data_source(database_id):
 
 
 def ensure_database_property(database_id, property_name, property_type, config):
-    """Ensure a property exists on the database's current data source.
+    """Ensure a property exists on the database's active data source.
 
-    Notion's newer API versions expose database properties through data sources.
-    Updating only /databases/{id} can leave the property absent from the data
-    source that is actually used by page creation/update calls, which then
-    avoids the legacy scheduler-property errors caused by the old schema.
+    The data-source schema is authoritative for the query/update endpoints used
+    by this script. Check it before creating a property so an existing property
+    is not accidentally recreated because it is absent from the database-level
+    response.
     """
-    database = notion(
-        "GET",
-        f"databases/{database_id}",
-    )
+    database = notion("GET", f"databases/{database_id}")
+    data_sources = database.get("data_sources", [])
+    if not data_sources:
+        raise RuntimeError(
+            f'No data source found for database {database_id} while checking '
+            f'"{property_name}".'
+        )
 
-    properties = database.get("properties", {})
+    data_source_id = data_sources[0]["id"]
+    data_source = notion("GET", f"data_sources/{data_source_id}")
+    properties = data_source.get("properties", {})
     existing = properties.get(property_name)
+
     if existing:
         if existing.get("type") != property_type:
             raise RuntimeError(
@@ -341,27 +321,14 @@ def ensure_database_property(database_id, property_name, property_type, config):
             )
         return
 
-    data_sources = database.get("data_sources", [])
-    if not data_sources:
-        raise RuntimeError(
-            f"No data source found for database {database_id} while creating "
-            f'"{property_name}".'
-        )
-
-    data_source_id = data_sources[0]["id"]
     print(
         f'Creating "{property_name}" {property_type} property in '
         f'data source {data_source_id}.'
     )
-
     notion(
         "PATCH",
         f"data_sources/{data_source_id}",
-        json={
-            "properties": {
-                property_name: config
-            }
-        },
+        json={"properties": {property_name: config}},
     )
 
 
@@ -662,7 +629,7 @@ def read_tasks():
             COMPLETED_UNITS_PROPERTY_NAME,
         )
         ensure_checkbox_property(database_id, "Bump")
-        ensure_checkbox_property(database_id, "canceled")
+        ensure_checkbox_property(database_id, "Canceled")
 
         data_source_id = get_data_source(database_id)
 
@@ -685,6 +652,22 @@ def read_tasks():
 
             unit = select_value(page, "Unit")
 
+            # One-time compatibility migration: if an older run created a
+            # lowercase/spelling-variant cancellation checkbox and it is
+            # checked, preserve that state in the canonical "Canceled" field.
+            canceled = checkbox_value(page, "Canceled")
+            legacy_canceled = (
+                checkbox_value(page, "canceled")
+                or checkbox_value(page, "cancelled")
+            )
+            if legacy_canceled and not canceled:
+                notion(
+                    "PATCH",
+                    f"pages/{page['id']}",
+                    json={"properties": {"Canceled": {"checkbox": True}}},
+                )
+                canceled = True
+
             tasks.append({
                 "page_id": page["id"],
                 "task": name,
@@ -698,7 +681,7 @@ def read_tasks():
                 "priority": select_value(page, "Priority"),
                 "completed": checkbox_value(page, "Completed"),
                 "bump": checkbox_value(page, "Bump"),
-                "canceled": checkbox_value(page, "canceled"),
+                "canceled": canceled,
                 "dependencies": relation_ids(page, DEPENDENCY_PROPERTY_NAME),
                 "minutes": workload_to_minutes(workload, unit),
             })
@@ -738,35 +721,20 @@ def task_remaining_units(task):
 
 
 def deadline_target_date(task, now):
+    """Return the preferred finish date without imposing daily capacity."""
     deadline = task.get("deadline")
     if not deadline:
         return None
-
-    deadline_day = deadline["start"].date()
-    today = now.date()
-
-    if deadline_day <= today:
-        return today
-
-    preferred = deadline_day - timedelta(days=1)
-    days = max(1, (preferred - today).days + 1)
-    remaining = task_remaining_minutes(task)
-
-    # Normally finish one day before the deadline. If that would require more
-    # than two hours/day, use the deadline day as well.
-    if remaining / days > MAX_PREFERRED_DAILY_MINUTES:
-        return deadline_day
-
-    return preferred
+    return deadline["start"].date()
 
 
 def required_daily_minutes(task, now):
-    target = deadline_target_date(task, now)
-    if target is None:
+    """A workload-pressure signal used for ranking, not capacity planning."""
+    deadline = task.get("deadline")
+    if not deadline:
         return 0
-
-    days = max(1, (target - now.date()).days + 1)
-    return task_remaining_minutes(task) / days
+    days_left = max(1, (deadline["start"].date() - now.date()).days)
+    return task_remaining_minutes(task) / days_left
 
 
 def priority_weight(priority):
@@ -778,78 +746,61 @@ def dependency_status(task, tasks_by_id):
 
     for dependency_id in task.get("dependencies", []):
         dependency = tasks_by_id.get(normalize_notion_id(dependency_id))
-        if dependency and not dependency.get("completed"):
+        if dependency and not dependency.get("completed") and not dependency.get("canceled"):
             unmet.append(dependency["task"])
 
     return bool(unmet), unmet
 
 
 def sort_key(task, now, tasks_by_id):
+    """Dynamic whole-task ordering: deadline urgency first, workload pressure second.
+
+    No capacity calculations or daily task splitting are performed. Tasks are
+    ranked again on every run, so their positions change as deadlines approach
+    and completed units reduce the remaining workload.
+    """
     deadline = task.get("deadline")
     blocked, _ = dependency_status(task, tasks_by_id)
-
-    overdue = False
-    due_today = False
-    days_left = float("inf")
+    remaining_minutes = task_remaining_minutes(task)
 
     if deadline:
-        deadline_day = deadline["start"].date()
-        days_left = (deadline_day - now.date()).days
-        overdue = days_left < 0
-        due_today = days_left == 0
-
-    if overdue:
-        bucket = 0
-    elif due_today:
-        bucket = 1
-    elif task.get("priority") == "High":
-        bucket = 2
-    elif deadline and required_daily_minutes(task, now) > 120:
-        bucket = 2
-    elif deadline and required_daily_minutes(task, now) > 60:
-        bucket = 3
-    elif deadline:
-        bucket = 4
+        days_left = (deadline["start"].date() - now.date()).days
+        if days_left < 0:
+            urgency_bucket = 0       # overdue
+        elif days_left == 0:
+            urgency_bucket = 1       # due today
+        elif days_left == 1:
+            urgency_bucket = 2       # due tomorrow
+        elif days_left <= 3:
+            urgency_bucket = 3       # due in 2–3 days
+        elif days_left <= 7:
+            urgency_bucket = 4       # due this week
+        elif days_left <= 14:
+            urgency_bucket = 5       # due in the next two weeks
+        else:
+            urgency_bucket = 6       # distant deadline
+        workload_pressure = remaining_minutes / max(days_left, 1)
     else:
-        bucket = 6
+        days_left = float("inf")
+        urgency_bucket = 7           # no deadline
+        workload_pressure = 0
 
-    if blocked:
-        bucket += 5
+    # Blocked tasks remain visible, but move below tasks that can be acted on.
+    blocked_penalty = 1 if blocked else 0
 
     return (
-        bucket,
+        urgency_bucket,
+        blocked_penalty,
+        -workload_pressure,
         priority_weight(task.get("priority")),
-        days_left,
-        -required_daily_minutes(task, now),
+        -remaining_minutes,
         task["task"].lower(),
     )
 
 
-def allocation_units_for_task(task, now, rank):
-    remaining_units = task_remaining_units(task)
-    if remaining_units <= 0:
-        return 0
-
-    daily_minutes = required_daily_minutes(task, now)
-
-    if daily_minutes > 0:
-        minutes = daily_minutes
-        if rank >= AHEAD_OF_SCHEDULE_START:
-            minutes = min(minutes, AHEAD_WORK_MINUTES)
-    else:
-        minutes = (
-            AHEAD_WORK_MINUTES
-            if rank >= AHEAD_OF_SCHEDULE_START
-            else NORMAL_WORK_MINUTES
-        )
-
-    return max(
-        1,
-        min(
-            remaining_units,
-            minutes_to_units(minutes, task["unit"]),
-        ),
-    )
+def allocation_units_for_task(task, now, rank=None):
+    """Keep the entire remaining task in one row; do not split into daily chunks."""
+    return task_remaining_units(task)
 
 
 # ============================================================
@@ -927,14 +878,11 @@ def allocation_task_id(allocation, tasks_by_id):
 
 
 def display_title(task):
-    """Title used in Task Allocations, without changing the source task."""
+    """Daily Plan title: original task, source label, and estimated remaining time."""
     base = task["task"].strip()
-    suffix = f" - {task['source_label']}"
-
-    if base.endswith(suffix):
-        return base
-
-    return f"{base}{suffix}"
+    source = task["source_label"]
+    estimate = format_task_estimate(task_remaining_minutes(task))
+    return f"{base} - {source} - {estimate}"
 
 
 def create_allocation(database_id, task, units, order):
@@ -1035,6 +983,19 @@ def process_allocation_actions(allocations, tasks_by_id):
 
         task = tasks_by_id[task_id]
 
+        # Bump from the Daily Plan is forwarded to the source task. The normal
+        # queue-ordering pass then moves it down three positions and clears it.
+        if allocation.get("bump"):
+            notion(
+                "PATCH",
+                f"pages/{task_id}",
+                json={"properties": {"Bump": {"checkbox": True}}},
+            )
+            update_allocation(
+                allocation["page_id"],
+                {"Bump": {"checkbox": False}},
+            )
+
         # Cancel marks the source task canceled and removes its active row.
         if allocation["cancel"]:
             notion(
@@ -1042,7 +1003,7 @@ def process_allocation_actions(allocations, tasks_by_id):
                 f"pages/{task_id}",
                 json={
                     "properties": {
-                        "canceled": {"checkbox": True},
+                        "Canceled": {"checkbox": True},
                         "Bump": {"checkbox": False},
                     }
                 },
@@ -1166,7 +1127,7 @@ def reconcile_allocations(tasks, allocations):
 
         matched[task_id] = allocation
 
-    # Update existing rows in place; create a row only if none exists.
+    # Update existing rows in place; each row represents the whole remaining task.
     for index, task in enumerate(ordered, start=1):
         task_id = normalize_notion_id(task["page_id"])
         units = allocation_units_for_task(task, now, index)
