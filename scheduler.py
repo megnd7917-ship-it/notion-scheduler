@@ -23,7 +23,15 @@ COMPLETED_UNITS_PROPERTY_NAME = "Completed Units"
 PFS_TASK_NAME = "PFS weekly hours"
 PFS_DATABASE_NAME = "PFS To-Do"
 CREATE_REQUEST_DELAY = 0.5
-MAX_RATE_LIMIT_RETRIES = 5
+MAX_RATE_LIMIT_RETRIES = 7
+# Notion's public API limit is roughly 3 requests/second. Leave headroom so
+# sequential database/schema lookups do not arrive in bursts.
+MIN_REQUEST_INTERVAL_SECONDS = 0.4
+_LAST_REQUEST_AT = 0.0
+_DATABASE_ID_CACHE = {}
+_DATABASE_OBJECT_CACHE = {}
+_DATA_SOURCE_ID_CACHE = {}
+_DATA_SOURCE_SCHEMA_CACHE = {}
 
 
 
@@ -146,62 +154,59 @@ HEADERS = {
 
 
 def notion(method, path, **kwargs):
+    """Call Notion with global pacing and robust 429 retry handling."""
+    global _LAST_REQUEST_AT
     url = f"https://api.notion.com/v1/{path}"
 
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        elapsed = time.monotonic() - _LAST_REQUEST_AT
+        if elapsed < MIN_REQUEST_INTERVAL_SECONDS:
+            time.sleep(MIN_REQUEST_INTERVAL_SECONDS - elapsed)
 
         response = requests.request(
             method,
             url,
             headers=HEADERS,
+            timeout=45,
             **kwargs,
         )
+        _LAST_REQUEST_AT = time.monotonic()
 
         if response.ok:
             if not response.content:
                 return {}
-
             return response.json()
 
         if response.status_code == 429:
-
-            retry_after = 3
-
+            # Notion returns retry_after in top-level additional_data. Some
+            # responses also provide Retry-After as an HTTP header.
+            retry_after = response.headers.get("Retry-After")
             try:
                 data = response.json()
-
-                retry_after = int(
-                    data.get("error", {})
-                    .get("additional_data", {})
-                    .get("retry_after", 3)
-                )
-
-            except Exception:
-                pass
+                retry_after = retry_after or data.get("additional_data", {}).get("retry_after")
+                retry_after = float(retry_after) if retry_after is not None else min(5 * (2 ** attempt), 60)
+            except (ValueError, TypeError):
+                retry_after = min(5 * (2 ** attempt), 60)
 
             if attempt >= MAX_RATE_LIMIT_RETRIES:
                 raise RuntimeError(
                     "Notion rate limit persisted after "
-                    f"{MAX_RATE_LIMIT_RETRIES} retries: "
-                    f"{response.text}"
+                    f"{MAX_RATE_LIMIT_RETRIES} retries: {response.text}"
                 )
 
+            wait_seconds = max(1.0, retry_after) + 0.25
             print(
-                "Notion rate limit reached. "
-                f"Waiting {retry_after} seconds..."
+                f"Notion rate limit reached. Waiting {wait_seconds:g} seconds "
+                f"before retry {attempt + 1}/{MAX_RATE_LIMIT_RETRIES}..."
             )
-
-            time.sleep(max(1, retry_after))
+            time.sleep(wait_seconds)
             continue
 
         raise RuntimeError(
-            f"Notion API error "
-            f"{response.status_code}: {response.text}"
+            f"Notion API error {response.status_code}: {response.text}"
         )
 
-    raise RuntimeError(
-        "Notion API request failed."
-    )
+    raise RuntimeError("Notion API request failed.")
 
 
 def search_all(query):
@@ -235,6 +240,9 @@ def search_all(query):
 
 
 def find_database(name):
+    if name in _DATABASE_ID_CACHE:
+        return _DATABASE_ID_CACHE[name]
+
     for obj in search_all(name):
 
         if obj.get("object") == "database":
@@ -245,6 +253,8 @@ def find_database(name):
             ).strip()
 
             if title == name:
+                _DATABASE_ID_CACHE[name] = obj["id"]
+                _DATABASE_OBJECT_CACHE[obj["id"]] = obj
                 return obj["id"]
 
         elif obj.get("object") == "data_source":
@@ -257,10 +267,10 @@ def find_database(name):
             if not database_id:
                 continue
 
-            database = notion(
-                "GET",
-                f"databases/{database_id}",
-            )
+            database = _DATABASE_OBJECT_CACHE.get(database_id)
+            if database is None:
+                database = notion("GET", f"databases/{database_id}")
+                _DATABASE_OBJECT_CACHE[database_id] = database
 
             title = "".join(
                 item.get("plain_text", "")
@@ -268,6 +278,7 @@ def find_database(name):
             ).strip()
 
             if title == name:
+                _DATABASE_ID_CACHE[name] = database_id
                 return database_id
 
     raise RuntimeError(
@@ -276,10 +287,13 @@ def find_database(name):
 
 
 def get_data_source(database_id):
-    data = notion(
-        "GET",
-        f"databases/{database_id}",
-    )
+    if database_id in _DATA_SOURCE_ID_CACHE:
+        return _DATA_SOURCE_ID_CACHE[database_id]
+
+    data = _DATABASE_OBJECT_CACHE.get(database_id)
+    if data is None or not data.get("data_sources"):
+        data = notion("GET", f"databases/{database_id}")
+        _DATABASE_OBJECT_CACHE[database_id] = data
 
     sources = data.get("data_sources", [])
 
@@ -289,30 +303,21 @@ def get_data_source(database_id):
             f"{database_id}."
         )
 
+    _DATA_SOURCE_ID_CACHE[database_id] = sources[0]["id"]
     return sources[0]["id"]
 
 
 def ensure_database_property(database_id, property_name, property_type, config):
-    """Ensure a property exists on the database's active data source.
+    """Ensure a property exists, using a cached authoritative data-source schema."""
+    data_source_id = get_data_source(database_id)
+    properties = _DATA_SOURCE_SCHEMA_CACHE.get(data_source_id)
 
-    The data-source schema is authoritative for the query/update endpoints used
-    by this script. Check it before creating a property so an existing property
-    is not accidentally recreated because it is absent from the database-level
-    response.
-    """
-    database = notion("GET", f"databases/{database_id}")
-    data_sources = database.get("data_sources", [])
-    if not data_sources:
-        raise RuntimeError(
-            f'No data source found for database {database_id} while checking '
-            f'"{property_name}".'
-        )
+    if properties is None:
+        data_source = notion("GET", f"data_sources/{data_source_id}")
+        properties = dict(data_source.get("properties", {}))
+        _DATA_SOURCE_SCHEMA_CACHE[data_source_id] = properties
 
-    data_source_id = data_sources[0]["id"]
-    data_source = notion("GET", f"data_sources/{data_source_id}")
-    properties = data_source.get("properties", {})
     existing = properties.get(property_name)
-
     if existing:
         if existing.get("type") != property_type:
             raise RuntimeError(
@@ -330,6 +335,8 @@ def ensure_database_property(database_id, property_name, property_type, config):
         f"data_sources/{data_source_id}",
         json={"properties": {property_name: config}},
     )
+    # Update the local schema only after Notion confirms the write succeeded.
+    properties[property_name] = {"type": property_type}
 
 
 def ensure_number_property(database_id, property_name):
@@ -374,11 +381,14 @@ def ensure_allocation_relation_properties(database_id):
     """
     allocation_data_source_id = get_data_source(database_id)
 
-    allocation_source = notion(
-        "GET",
-        f"data_sources/{allocation_data_source_id}",
-    )
-    existing_properties = allocation_source.get("properties", {})
+    existing_properties = _DATA_SOURCE_SCHEMA_CACHE.get(allocation_data_source_id)
+    if existing_properties is None:
+        allocation_source = notion(
+            "GET",
+            f"data_sources/{allocation_data_source_id}",
+        )
+        existing_properties = dict(allocation_source.get("properties", {}))
+        _DATA_SOURCE_SCHEMA_CACHE[allocation_data_source_id] = existing_properties
 
     for source_database_name, relation_name in SOURCE_DATABASES.items():
         source_database_id = find_database(source_database_name)
@@ -435,6 +445,10 @@ def ensure_allocation_relation_properties(database_id):
                 }
             },
         )
+        existing_properties[relation_name] = {
+            "type": "relation",
+            "relation": {"data_source_id": source_data_source_id},
+        }
 
         # Keep our local schema copy current so multiple missing relations can
         # be added in one run without depending on another GET response.
