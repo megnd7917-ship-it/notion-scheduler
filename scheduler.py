@@ -122,14 +122,16 @@ def find_data_source(database_name):
             if plain_title(item.get("title")) != database_name:
                 continue
             database = item
+
         elif item.get("object") == "data_source":
             database_id = item.get("parent", {}).get("database_id")
             if not database_id:
                 continue
-                
-             database = notion("GET", f"databases/{database_id}")
+
+            database = notion("GET", f"databases/{database_id}")
             if plain_title(database.get("title")) != database_name:
                 continue
+
         else:
             continue
 
@@ -137,8 +139,12 @@ def find_data_source(database_name):
         if not data_sources:
             database = notion("GET", f"databases/{database['id']}")
             data_sources = database.get("data_sources", [])
+
         if not data_sources:
-            raise RuntimeError(f'No data source found for database "{database_name}".')
+            raise RuntimeError(
+                f'No data source found for database "{database_name}".'
+            )
+
         return data_sources[0]["id"]
 
     raise RuntimeError(
