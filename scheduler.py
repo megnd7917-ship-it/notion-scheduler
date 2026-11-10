@@ -126,7 +126,8 @@ def find_data_source(database_name):
             database_id = item.get("parent", {}).get("database_id")
             if not database_id:
                 continue
-     database = notion("GET", f"databases/{database_id}")
+                
+             database = notion("GET", f"databases/{database_id}")
             if plain_title(database.get("title")) != database_name:
                 continue
         else:
