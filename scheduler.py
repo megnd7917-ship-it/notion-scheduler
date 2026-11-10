@@ -1,186 +1,3 @@
-
-yes, i will create a filter which does not include them, and then a view which is only for completed tasks.
-Perfect. That's exactly how I'd handle it.
-
-We'll have Python exclude completed tasks from ranking, but leave them untouched in the database. Your two Notion views will handle visibility:
-
-Daily Plan: Completed unchecked, sorted by Schedule Order ascending.
-
-Completed Tasks: Completed checked, sorted by completion date if you eventually add one, or simply by due date.
-
-Our agreed setup
-Property
-
-Type
-
-Python's role
-
-Task
-
-Title
-
-Reads
-
-Category
-
-Select
-
-Reads
-
-Due Date
-
-Date
-
-Reads
-
-Estimated Time
-
-Select
-
-Converts to minutes
-
-Notes
-
-Text
-
-Leaves alone
-
-Submitted
-
-Checkbox
-
-Reads
-
-Completed
-
-Checkbox
-
-Excludes checked tasks
-
-Schedule Order
-
-Number
-
-Writes
-
-One addition: we'll need a Completed checkbox in Task Submission if you haven't created it already.
-
-Next step
-Before I rewrite scheduler.py, let's confirm the database schema is in place. Have you created Schedule Order and Completed in Task Submission yet?
-
-
-
-
-i created a completed checkbox. do i need to create a new property for it to input into?
-Yes! You need one more property in Task Submission:
-
-Property
-
-Type
-
-Schedule Order
-
-Number
-
-Python will write the ranking into this property (1, 2, 3, etc.).
-
-You already have Completed as a checkbox, so you don't need to create anything else for that.
-
-Once you've created Schedule Order, we'll be ready to adapt the Python code.
-
-
-
-
-User attachment
-here you go
-Excellent! Your Task Submission database is almost ready. I can see that you've created both properties we needed:
-
-Ready Completed — checkbox
-
-Ready Schedule Order — number
-
-I can also see Task, Due Date, Category, Estimated Time, and Notes. Those are all in place.
-
-One property is still missing: Submitted (Checkbox).
-
-I'd keep it because it lets you distinguish between tasks you're still entering and tasks ready for Python to rank.
-
-Add that one property, and we'll have the complete schema.
-
-I also see a Formula property. We can leave it alone for now; I just want to know what it does before we decide whether to remove it.
-
-i don't think that's necessary, do you>
-You're right. We don't need Submitted if we want to keep things simple.
-
-Python can rank all incomplete tasks in Task Submission automatically, without a separate submission flag.
-
-That means:
-
-New tasks are included automatically.
-
-Completed tasks are excluded.
-
-No extra checkbox to manage.
-
-One caveat: unfinished task entries will also be ranked. But if you're comfortable with that, I'd leave Submitted out.
-
-Your existing properties are enough. Let's keep the database as it is.
-
-
-
-
-great. can you give me the script?
-
-Worked for 30s
-I've rebuilt your scheduler as a much leaner script.
-
-scheduler.py
-
-New standalone Python scheduler
-
-Download scheduler.py
-
-Created
-What this version does
-Reads tasks directly from Task Submission.
-
-Excludes tasks marked Completed.
-
-Ranks overdue and approaching deadlines first.
-
-Considers estimated time when ranking tasks.
-
-Writes numerical rankings into Schedule Order.
-
-Avoids unnecessary Notion updates when the ranking hasn't changed.
-
-Handles your time estimates, including custom minute increments and 3+ hours.
-
-What it removes
-No more:
-
-Separate category databases.
-
-Task Allocations.
-
-Priority or Bump.
-
-Workload and Unit calculations.
-
-Dependency tracking.
-
-Task creation, deletion, or archiving.
-
-Before we install it
-Don't replace your existing script yet. First, make a backup.
-
-Then we'll replace the old scheduler.py in GitHub and update your workflow to run once each morning at 5 AM Pacific, with manual triggering available.
-
-One important note: this version has been syntax-checked, but hasn't yet been tested against your live Notion database. We'll verify the connection and property names before relying on its rankings.
-
-
-scheduler.py
-Code
 import os
 import re
 import time
@@ -309,6 +126,189 @@ def find_data_source(database_name):
             database_id = item.get("parent", {}).get("database_id")
             if not database_id:
                 continue
+     database = notion("GET", f"databases/{database_id}")
+            if plain_title(database.get("title")) != database_name:
+                continue
+        else:
+            continue
+
+        data_sources = database.get("data_sources", [])
+        if not data_sources:
+            database = notion("GET", f"databases/{database['id']}")
+            data_sources = database.get("data_sources", [])
+        if not data_sources:
+            raise RuntimeError(f'No data source found for database "{database_name}".')
+        return data_sources[0]["id"]
+
+    raise RuntimeError(
+        f'Could not find database "{database_name}". Check its name and make sure the Notion integration has access to it.'
+    )
+
+
+def get_schema(data_source_id):
+    data_source = notion("GET", f"data_sources/{data_source_id}")
+    return data_source.get("properties", {})
+
+
+def validate_schema(properties):
+    required = {
+        TASK_PROPERTY: "title",
+        DUE_DATE_PROPERTY: "date",
+        ESTIMATED_TIME_PROPERTY: "select",
+        COMPLETED_PROPERTY: "checkbox",
+        SCHEDULE_ORDER_PROPERTY: "number",
+    }
+    problems = []
+    for name, expected_type in required.items():
+        actual = properties.get(name, {}).get("type")
+        if actual != expected_type:
+            problems.append(f'"{name}" should be {expected_type}, found {actual or "missing"}')
+    if problems:
+        raise RuntimeError("Task Submission database schema needs attention:\n- " + "\n- ".join(problems))
+
+
+def query_all_pages(data_source_id):
+    pages = []
+    cursor = None
+
+    while True:
+        payload = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        data = notion("POST", f"data_sources/{data_source_id}/query", json=payload)
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            return pages
+        cursor = data.get("next_cursor")
+
+
+def get_title(page, property_name):
+    prop = page.get("properties", {}).get(property_name, {})
+    if prop.get("type") != "title":
+        return ""
+    return plain_title(prop.get("title"))
+
+
+def get_checkbox(page, property_name):
+    prop = page.get("properties", {}).get(property_name, {})
+    return bool(prop.get("checkbox", False)) if prop.get("type") == "checkbox" else False
+
+
+def get_select(page, property_name):
+    prop = page.get("properties", {}).get(property_name, {})
+    if prop.get("type") != "select" or not prop.get("select"):
+        return None
+    return prop["select"].get("name")
+
+
+def get_date(page, property_name):
+    prop = page.get("properties", {}).get(property_name, {})
+    if prop.get("type") != "date" or not prop.get("date"):
+        return None
+    start = prop["date"].get("start")
+    if not start:
+        return None
+    # Notion date-only values are YYYY-MM-DD. If a time is present, use its local date.
+    return date.fromisoformat(start[:10])
+
+
+def estimate_minutes(label):
+    """Convert a Notion select label to minutes, including custom increments."""
+    if not label:
+        return 0
+    if label in ESTIMATED_MINUTES:
+        return ESTIMATED_MINUTES[label]
+
+    normalized = label.strip().casefold()
+    if normalized in {"3+ hours", "3 + hours", "3 or more hours"}:
+        return 180
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(minutes?|mins?)", normalized)
+    if match:
+        return int(round(float(match.group(1))))
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?)", normalized)
+    if match:
+        return int(round(float(match.group(1)) * 60))
+
+    raise RuntimeError(
+        f'Cannot interpret Estimated Time option "{label}". '
+        'Use a label such as "25 minutes", "1 hour", "1.5 hours", or "3+ hours".'
+    )
+
+
+def urgency_bucket(due_date, today):
+    if due_date is None:
+        return 7
+    days_left = (due_date - today).days
+    if days_left < 0:
+        return 0  # Overdue
+    if days_left == 0:
+        return 1  # Due today
+    if days_left == 1:
+        return 2  # Due tomorrow
+    if days_left <= 3:
+        return 3  # Due in 2-3 days
+    if days_left <= 7:
+        return 4  # Due this week
+    if days_left <= 14:
+        return 5  # Due in the next two weeks
+    return 6      # Later deadline
+
+
+def task_sort_key(task, today):
+    due_date = task["due_date"]
+    minutes = task["minutes"]
+    bucket = urgency_bucket(due_date, today)
+
+    if due_date is None:
+        workload_pressure = 0
+    else:
+        days_left = max(1, (due_date - today).days)
+        workload_pressure = minutes / days_left
+
+    # Deadline group first; within a group, prioritize more work per day remaining.
+    return (
+        bucket,
+        -workload_pressure,
+        -minutes,
+        task["name"].casefold(),
+    )
+
+
+def read_active_tasks(pages):
+    tasks = []
+    completed_count = 0
+
+    for page in pages:
+        name = get_title(page, TASK_PROPERTY)
+        if not name:
+            continue
+
+        if get_checkbox(page, COMPLETED_PROPERTY):
+            completed_count += 1
+            continue
+
+        estimate_label = get_select(page, ESTIMATED_TIME_PROPERTY)
+        tasks.append({
+            "page_id": page["id"],
+            "name": name,
+            "due_date": get_date(page, DUE_DATE_PROPERTY),
+            "minutes": estimate_minutes(estimate_label),
+            "schedule_order": page.get("properties", {}).get(SCHEDULE_ORDER_PROPERTY, {}).get("number"),
+        })
+
+    print(f"Incomplete tasks found: {len(tasks)}")
+    print(f"Completed tasks skipped: {completed_count}")
+    return tasks
+
+
+def write_schedule_order(tasks):
+    """Write ranks 1..N, avoiding API writes when the value is already correct."""
+    changed = 0
+    for rank, task in enumerate(tasks, start=1):
+        if task["schedule_order"] == rank:
+            continue
 
         notion(
             "PATCH",
@@ -347,6 +347,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
